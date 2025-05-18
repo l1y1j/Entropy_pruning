@@ -48,6 +48,7 @@ val_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=dataset_type,
+        data_root=data_root,
         # ann_file='test_s4.json',
         ann_file='val_mix.json',
         data_prefix=dict(img='patch_mix'),
@@ -59,9 +60,10 @@ test_dataloader = val_dataloader
 
 val_evaluator = dict(
     type='PANDAMetric',
-    ann_file='val_mix.json',
+    ann_file=f'{data_root}/val_mix.json',
     metric='bbox',
-    format_only=False
+    format_only=False,
+    classwise=True,
 )
 test_evaluator = val_evaluator
 

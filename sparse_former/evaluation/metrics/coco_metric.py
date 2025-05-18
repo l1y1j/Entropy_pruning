@@ -29,14 +29,12 @@ class PANDAMetric(MM_CocoMetric):
         self,
         *,
         ann_file: Optional[str] = None,
-        backend_args: dict = None,
         sort_categories: bool = False,
         coco_eval_config: dict = dict(type='PANDAEval'), 
         **kwargs
     ) -> None:
         super().__init__(
             ann_file=None,
-            backend_args=backend_args,
             sort_categories=False,
             **kwargs
         )
@@ -152,8 +150,7 @@ class PANDAMetric(MM_CocoMetric):
                 gt_coco = COCO(coco_json_path)
             else:
                 with get_local_path(
-                    self.ann_file, 
-                    backend_args=self.backend_args
+                    self.ann_file 
                 ) as local_path:
                     gt_coco = COCO(local_path)
 

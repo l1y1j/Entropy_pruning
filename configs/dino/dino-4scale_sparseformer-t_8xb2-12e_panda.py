@@ -3,7 +3,7 @@ _base_ = [
 ]
 
 # pretrained = 'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa
-pretrained = '/home/liwenxi/mmdetection/giga_tiny_global.pth'  # noqa
+pretrained = 'local-data/models/liwenxi/giga_tiny_global.pth'  # noqa
 
 find_unused_parameters=True
 model = dict(
@@ -16,7 +16,8 @@ model = dict(
         mean=[123.675, 116.28, 103.53],
         std=[58.395, 57.12, 57.375],
         bgr_to_rgb=True,
-        pad_size_divisor=1),
+        pad_size_divisor=1
+    ),
     # backbone=dict(
     #     type='ResNet',
     #     depth=50,
@@ -48,7 +49,7 @@ model = dict(
         # in FPN, otherwise some parameter will not be used
         with_cp=False,
         convert_weights=True,
-        # init_cfg=dict(type='Pretrained', checkpoint=pretrained)
+        init_cfg=dict(type='Pretrained', checkpoint=pretrained)
     ),
     neck=dict(
         type='ChannelMapper',
@@ -118,7 +119,8 @@ model = dict(
 train_pipeline = [
     dict(
         type='LoadImageFromFile',
-        file_client_args={{_base_.file_client_args}}),
+        file_client_args={{_base_.file_client_args}}
+    ),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='RandomFlip', prob=0.5),
     dict(
@@ -172,7 +174,8 @@ optim_wrapper = dict(
 # learning policy
 max_epochs = 12
 train_cfg = dict(
-    type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
+    type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1
+)
 
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
@@ -191,3 +194,7 @@ param_scheduler = [
 # USER SHOULD NOT CHANGE ITS VALUES.
 # base_batch_size = (8 GPUs) x (2 samples per GPU)
 auto_scale_lr = dict(base_batch_size=16)
+
+from datetime import datetime
+work_dir = f'local-data/local-log/{datetime.now().strftime("%Y%m%d_%H%M%S")}_dino_8×_12e'
+del datetime
