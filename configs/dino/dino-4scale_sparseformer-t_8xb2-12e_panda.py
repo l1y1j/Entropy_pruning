@@ -48,7 +48,8 @@ model = dict(
         # in FPN, otherwise some parameter will not be used
         with_cp=False,
         convert_weights=True,
-        init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
+        # init_cfg=dict(type='Pretrained', checkpoint=pretrained)
+    ),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],

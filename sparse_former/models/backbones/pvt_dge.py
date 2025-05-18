@@ -10,7 +10,8 @@ from timm.models.vision_transformer import _cfg
 from mmdet.vtpack.layers import DynamicGrainedEncoder
 from mmdet.vtpack.layers.sparse_ops import batched_sparse_attention, batched_sparse_gemm
 
-from mmdet.registry import MODELS
+from sparse_former.registry import MODELS
+
 __all__ = [
     "pvt_dge_s124_tiny_256", "pvt_dge_s124_small_256",
     "pvt_dge_s124_medium_256", "pvt_dge_s124_large_256",

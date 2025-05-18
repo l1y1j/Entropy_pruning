@@ -23,11 +23,11 @@ from mmengine.utils import to_2tuple
 # from mmcv.cnn.bricks.registry import DROPOUT_LAYERS
 # from ...utils import get_root_logger
 from mmengine.logging import MMLogger
-from mmdet.registry import MODELS
 # from ..builder import BACKBONES
 # from ..utils.ckpt_convert import giga_converter
 # from ..utils.transformer import PatchEmbed, PatchMerging
 from mmdet.models import PatchEmbed, PatchMerging
+from sparse_former.registry import MODELS
 
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:

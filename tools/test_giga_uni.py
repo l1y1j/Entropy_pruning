@@ -7,7 +7,7 @@ import pylab
 import tqdm
 import pickle
 from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
+from .sparse_former.models.task_modules import PANDAEval
 
 if __name__ == '__main__':
     annFile = './p_test.json'
@@ -52,7 +52,7 @@ if __name__ == '__main__':
     imgIds = sorted(cocoGt.getImgIds())
 
     # # running evaluation
-    cocoEval = COCOeval(cocoGt, cocoDt, annType)
+    cocoEval = PANDAEval(cocoGt, cocoDt, annType)
     cocoEval.params.imgIds = imgIds
     cocoEval.params.maxDets = [500, 500, 100]
     cocoEval.evaluate()

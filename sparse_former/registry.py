@@ -55,12 +55,14 @@ PARAM_SCHEDULERS = Registry(
 METRICS = Registry(
     'metric', 
     parent=mmengine_registry.METRICS,
+    locations=['sparse_former.evaluation.metrics'] 
 )
 
 # manage task-specific modules like anchor generators and box coders
 TASK_UTILS = Registry(
     'task util', 
     parent=mmengine_registry.TASK_UTILS,
+    locations=['sparse_former.models.task_modules'] 
 )
 
 # manage visualizer

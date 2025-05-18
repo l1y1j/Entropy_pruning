@@ -50,7 +50,7 @@ val_dataloader = dict(
 test_dataloader = val_dataloader
 
 val_evaluator = dict(
-    type='CocoMetric',
+    type='PANDAMetric',
     ann_file='/lustre/home/acct-eexdl/eexdl/liwenxi/QIYUAN/panda/test_s4.json',
     metric='bbox',
     format_only=False)

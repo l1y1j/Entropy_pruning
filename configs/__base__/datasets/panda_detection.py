@@ -1,6 +1,7 @@
+
 # dataset settings
 dataset_type = 'CocoDataset'
-data_root = '/home/liwenxi/panda/'
+data_root = 'data/PANDA_processed'
 
 file_client_args = dict(backend='disk')
 
@@ -18,8 +19,11 @@ test_pipeline = [
     dict(type='LoadAnnotations', with_bbox=True),
     dict(
         type='PackDetInputs',
-        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
-                   'scale_factor'))
+        meta_keys=(
+            'img_id', 'img_path', 'ori_shape', 'img_shape',
+            'scale_factor'
+        )
+    )
 ]
 train_dataloader = dict(
     batch_size=1,
@@ -33,7 +37,9 @@ train_dataloader = dict(
         ann_file='train_mix_all_train.json',
         data_prefix=dict(img='patch_mix_alltrain'),
         filter_cfg=dict(filter_empty_gt=True, min_size=32),
-        pipeline=train_pipeline))
+        pipeline=train_pipeline
+    )
+)
 val_dataloader = dict(
     batch_size=1,
     num_workers=2,
@@ -42,18 +48,21 @@ val_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=dataset_type,
-        data_root='/data/liwenxi/data/PANDA',
-        ann_file='test_s4.json',
-        data_prefix=dict(img='s4_test'),
+        # ann_file='test_s4.json',
+        ann_file='val_mix.json',
+        data_prefix=dict(img='patch_mix'),
         test_mode=True,
-        pipeline=test_pipeline))
+        pipeline=test_pipeline
+    )
+)
 test_dataloader = val_dataloader
 
 val_evaluator = dict(
-    type='CocoMetric',
-    ann_file='/data/liwenxi/data/PANDA/test_s4.json',
+    type='PANDAMetric',
+    ann_file='val_mix.json',
     metric='bbox',
-    format_only=False)
+    format_only=False
+)
 test_evaluator = val_evaluator
 
 #
