@@ -1,8 +1,8 @@
-mmcv>=2.0.0rc4,<2.1.0
-mmengine>=0.4.0,<1.0.0
-mmdet==3.0.0rc6
+mmcv>=2.0.0rc4,<2.2.0
+mmengine>=0.7.1,<1.0.0
+mmdet==3.3.0
 tensorboard
-Pillow==9.5.0
+Pillow
 pydantic
 numba
-timm
+timm==0.4.12
