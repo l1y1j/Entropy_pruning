@@ -282,9 +282,9 @@ class PANDAMetric(MM_CocoMetric):
 
     @staticmethod
     def prepare_sample(sample: DetDataSample):
-        if 'scale_factor' in sample:
-            bboxes = sample['gt_instances']['bboxes'] 
-            bboxes[..., :4] /= bboxes.new_tensor(sample['scale_factor']).repeat((1, 2))
+        # if 'scale_factor' in sample:
+        #     bboxes = sample['gt_instances']['bboxes'] 
+        #     bboxes[..., :4] /= bboxes.new_tensor(sample['scale_factor']).repeat((1, 2))
         return sample
     
     def process_hook(self, gt: dict, pred: dict, sample: DetDataSample):
