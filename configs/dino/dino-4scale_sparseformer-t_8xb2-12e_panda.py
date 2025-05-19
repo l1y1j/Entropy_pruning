@@ -129,10 +129,13 @@ train_pipeline = [
             [
                 dict(
                     type='RandomChoiceResize',
-                    scales=[(480, 1333), (512, 1333), (544, 1333), (576, 1333),
-                            (608, 1333), (640, 1333), (672, 1333), (704, 1333),
-                            (736, 1333), (768, 1333), (800, 1333)],
-                    keep_ratio=True)
+                    scales=[
+                        (480, 1333), (512, 1333), (544, 1333), (576, 1333),
+                        (608, 1333), (640, 1333), (672, 1333), (704, 1333),
+                        (736, 1333), (768, 1333), (800, 1333)
+                    ],
+                    keep_ratio=True
+                )
             ],
             [
                 dict(
@@ -140,25 +143,33 @@ train_pipeline = [
                     # The radio of all image in train dataset < 7
                     # follow the original implement
                     scales=[(400, 4200), (500, 4200), (600, 4200)],
-                    keep_ratio=True),
+                    keep_ratio=True
+                ),
                 dict(
                     type='RandomCrop',
                     crop_type='absolute_range',
                     crop_size=(384, 600),
-                    allow_negative_crop=True),
+                    allow_negative_crop=True
+                ),
                 dict(
                     type='RandomChoiceResize',
-                    scales=[(480, 1333), (512, 1333), (544, 1333), (576, 1333),
-                            (608, 1333), (640, 1333), (672, 1333), (704, 1333),
-                            (736, 1333), (768, 1333), (800, 1333)],
-                    keep_ratio=True)
+                    scales=[
+                        (480, 1333), (512, 1333), (544, 1333), (576, 1333),
+                        (608, 1333), (640, 1333), (672, 1333), (704, 1333),
+                        (736, 1333), (768, 1333), (800, 1333)
+                    ],
+                    keep_ratio=True
+                )
             ]
         ]),
     dict(type='PackDetInputs')
 ]
 train_dataloader = dict(
     dataset=dict(
-        filter_cfg=dict(filter_empty_gt=False), pipeline=train_pipeline))
+        filter_cfg=dict(filter_empty_gt=False), 
+        pipeline=train_pipeline
+    )
+)
 
 # optimizer
 optim_wrapper = dict(
@@ -166,7 +177,8 @@ optim_wrapper = dict(
     optimizer=dict(
         type='AdamW',
         lr=0.0001,  # 0.0002 for DeformDETR
-        weight_decay=0.0001),
+        weight_decay=0.0001
+    ),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)})
 )  # custom_keys contains sampling_offsets and reference_points in DeformDETR  # noqa
@@ -187,7 +199,8 @@ param_scheduler = [
         end=max_epochs,
         by_epoch=True,
         milestones=[11],
-        gamma=0.1)
+        gamma=0.1
+    )
 ]
 
 # NOTE: `auto_scale_lr` is for automatically scaling LR,
