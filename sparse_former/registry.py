@@ -19,6 +19,7 @@ HOOKS = Registry(
 DATASETS = Registry(
     'dataset', 
     parent=mmdet_registry.DATASETS,
+    locations=['sparse_former.datasets'],
 )
 DATA_SAMPLERS = Registry('data sampler', parent=mmdet_registry.DATA_SAMPLERS)
 TRANSFORMS = Registry(
