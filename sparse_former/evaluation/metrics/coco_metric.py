@@ -204,6 +204,7 @@ class PANDAMetric(MM_CocoMetric):
             coco_eval.evaluate()
             coco_eval.accumulate()
             coco_eval.summarize()
+            # !Note: 按类别计算的 mAP 用的是最大数目的包围框(idx == -1)，而所有类别 mAP 的计算用的是最小数量的包围框(idx == 0)
             if self.classwise:  # Compute per-category AP
                 # Compute per-category AP
                 # from https://github.com/facebookresearch/detectron2/

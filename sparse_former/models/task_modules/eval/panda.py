@@ -9,6 +9,7 @@ class PANDAEval(MM_COCOEval):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # todo @longlong.yu 检测框都按 500 来算
         self.params.areaRng = [[0 ** 2, 1e5 ** 2], [0 ** 2, 96 ** 2], [96 ** 2, 288 ** 2], [288 ** 2, 1e5 ** 2]]
         
     
