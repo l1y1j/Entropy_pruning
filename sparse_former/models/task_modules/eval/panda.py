@@ -9,8 +9,9 @@ class PANDAEval(MM_COCOEval):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # todo @longlong.yu 检测框都按 500 来算
+        # !Note: 检测框都按 500 来算
         self.params.areaRng = [[0 ** 2, 1e5 ** 2], [0 ** 2, 96 ** 2], [96 ** 2, 288 ** 2], [288 ** 2, 1e5 ** 2]]
+        self.params.maxDets = [500, 500, 500]
         
     
     def summarize(self):
@@ -51,7 +52,7 @@ class PANDAEval(MM_COCOEval):
             return mean_s
         def _summarizeDets():
             stats = np.zeros((12,))
-            stats[0] = _summarize(1)
+            stats[0] = _summarize(1, maxDets=self.params.maxDets[0])
             stats[1] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2])
             stats[2] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2])
             stats[3] = _summarize(1, iouThr=.5, areaRng='small', maxDets=self.params.maxDets[2])

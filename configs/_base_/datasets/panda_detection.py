@@ -42,7 +42,8 @@ train_dataloader = dict(
         ann_file='train_mix_all_train.json',
         data_prefix=dict(img='patch_mix_alltrain'),
         filter_cfg=dict(filter_empty_gt=True, min_size=32),
-        pipeline=train_pipeline
+        pipeline=train_pipeline,
+        limit_n=0,
     )
 )
 val_dataloader = dict(

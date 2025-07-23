@@ -33,6 +33,7 @@ class PANDAMetric(MM_CocoMetric):
         coco_eval_config: dict = dict(type='PANDAEval'), 
         **kwargs
     ) -> None:
+        kwargs['proposal_nums'] = (500, 500, 500)
         super().__init__(
             ann_file=None,
             sort_categories=False,
