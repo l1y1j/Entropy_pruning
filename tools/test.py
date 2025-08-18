@@ -2,7 +2,8 @@
 import argparse
 import os
 import os.path as osp
-
+import sys
+sys.path.append('.')
 from mmengine.config import Config, DictAction
 from mmengine.evaluator import DumpResults
 from mmengine.runner import Runner

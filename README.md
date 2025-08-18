@@ -9,7 +9,7 @@
 <img src="https://img.shields.io/badge/License-CC%20BY%204.0-green.svg" alt="License">
 <img src="https://img.shields.io/github/stars/liwenxi/SparseFormer?color=yellow" alt="Stars">
 <img src="https://img.shields.io/github/issues/liwenxi/SparseFormer?color=red" alt="Issues">
-<img src="https://img.shields.io/badge/python-3.8-purple.svg" alt="Python">
+<img src="https://img.shields.io/badge/python-3.9-purple.svg" alt="Python">
 <!-- **Authors:** -->
 <!-- **_¹  [Wenxi Li](https://liwenxi.github.io/)_** -->
 
@@ -36,7 +36,17 @@ Recent years have seen a significant rise in gigapixel-level image/video capture
 - [Usage](#usage)
 - [Future Work and Contributions](#future-work-and-contributions)
 
+---
 
+### Installation
+```bash
+conda create --name sparse-former python=3.9 -y
+conda activate sparse-former
+conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+pip install -r requirements.txt
+```
+
+---
 
 ### * The core code has been released. More docs will be updated in the future. Feel free to issue！
 
