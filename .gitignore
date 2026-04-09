@@ -67,7 +67,7 @@ instance/
 # Sphinx documentation
 docs/en/_build/
 docs/zh_cn/_build/
-src
+# src
 
 # PyBuilder
 target/
@@ -129,3 +129,5 @@ local-*/*
 # ignore local development environment
 .vscode/*
 .conda/*
+outputs/
+pretrained_model/

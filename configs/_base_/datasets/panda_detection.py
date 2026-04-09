@@ -1,7 +1,7 @@
 
 # dataset settings
 dataset_type = 'PandaDataset'
-data_root = 'data/PANDA_processed'
+data_root = '/data/linyujie/projects/Entropy_pruning/data/PANDA_processed'
 file_client_args = dict(backend='disk')
 
 _metainfo = dict(classes=(
