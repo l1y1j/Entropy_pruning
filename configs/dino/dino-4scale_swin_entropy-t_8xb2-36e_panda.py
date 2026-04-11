@@ -37,13 +37,12 @@ model = dict(
         init_cfg=None,
         
         entropy_pruning=dict(
-            enabled=False,
-            strategy='kl',
-            block_size=2,
-            keep_ratio=0.7,
-            stages_to_prune=[2, 3],
-            vis_interval=1,
-            vis_enabled=True,
+            enabled=True,
+            stages_to_prune=[2],
+            block_indices=[0, 2, 4],
+            block_keep_ratio={
+                2: [0.7, 0.5, 0.3]
+            },
         )),
     neck=dict(
         type='ChannelMapper',

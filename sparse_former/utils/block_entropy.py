@@ -6,6 +6,29 @@ import numpy as np
 from PIL import Image
 
 
+def compute_window_relative_entropy(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
+    """
+    计算每个窗口的相对熵（KL散度），保留Batch维度独立计算
+    
+    Args:
+        x_windows: (total_windows, window_size, window_size, C) - 总窗口数 = B * N_win
+        B: Batch大小
+        window_size: 窗口大小，默认7
+    
+    Returns:
+        kl: (B * N_win,) 每个窗口的相对熵
+    """
+    total_windows, _, _, C = x_windows.shape
+    N_win = total_windows // B
+    
+    x_windows = x_windows.view(B, N_win, window_size * window_size, C)
+    local_dist = F.softmax(x_windows.mean(dim=2), dim=-1)
+    global_dist = local_dist.mean(dim=1, keepdim=True)
+    kl = (local_dist * torch.log(local_dist / (global_dist + 1e-8))).sum(dim=-1)
+    
+    return kl.view(-1)  # 返回 (B * N_win,)
+
+
 def compute_channel_distribution(features: torch.Tensor, spatial_dims: Tuple[int, int]) -> torch.Tensor:
     """
     Compute channel distribution from features.
@@ -354,5 +377,78 @@ def visualize_scores_3panel(
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
+    
+    plt.close()
+
+
+def visualize_multi_block_scores(
+    block_scores: List[torch.Tensor],
+    stage_idx: int,
+    image: Optional[Image.Image] = None,
+    save_path: Optional[str] = None
+) -> None:
+    """
+    Visualize entropy scores for multiple blocks in a stage.
+    
+    Creates a figure with 3 columns per block:
+    - Column 1: Original image
+    - Column 2: Heatmap overlay
+    - Column 3: Score map
+    
+    Args:
+        block_scores: List of (H, W) score tensors for each block
+        stage_idx: stage index
+        image: PIL Image for overlay (optional)
+        save_path: path to save figure
+    """
+    import matplotlib.pyplot as plt
+    
+    num_blocks = len(block_scores)
+    if num_blocks == 0:
+        return
+    
+    fig_width = 5 * 3
+    fig_height = 5 * num_blocks
+    fig, axes = plt.subplots(num_blocks, 3, figsize=(fig_width, fig_height))
+    
+    if num_blocks == 1:
+        axes = axes.reshape(1, -1)
+    
+    for block_idx, score_map in enumerate(block_scores):
+        score_map_np = score_map.cpu().numpy()
+        
+        if image is not None:
+            img_w, img_h = image.size
+            original_size = (img_w, img_h)
+        else:
+            original_size = (score_map.shape[1], score_map.shape[0])
+        
+        resized_heatmap = resize_heatmap(score_map, original_size)
+        resized_heatmap_np = resized_heatmap.cpu().numpy()
+        
+        axes[block_idx, 0].imshow(image if image else np.zeros((original_size[1], original_size[0], 3)))
+        axes[block_idx, 0].set_title(f'Block {block_idx} - Original')
+        axes[block_idx, 0].axis('off')
+        
+        if image:
+            axes[block_idx, 1].imshow(image)
+            im = axes[block_idx, 1].imshow(resized_heatmap_np, cmap='jet', alpha=0.6)
+        else:
+            axes[block_idx, 1].imshow(resized_heatmap_np, cmap='jet')
+            im = axes[block_idx, 1].imshow(resized_heatmap_np, cmap='jet')
+        axes[block_idx, 1].set_title(f'Block {block_idx} - Overlay')
+        axes[block_idx, 1].axis('off')
+        plt.colorbar(im, ax=axes[block_idx, 1], fraction=0.046, pad=0.04)
+        
+        im = axes[block_idx, 2].imshow(resized_heatmap_np, cmap='jet')
+        axes[block_idx, 2].set_title(f'Block {block_idx} - KL Score')
+        axes[block_idx, 2].axis('off')
+        plt.colorbar(im, ax=axes[block_idx, 2], fraction=0.046, pad=0.04)
+    
+    plt.suptitle(f'Stage {stage_idx} - KL Divergence per Block', fontsize=16, y=1.02)
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
     
     plt.close()
