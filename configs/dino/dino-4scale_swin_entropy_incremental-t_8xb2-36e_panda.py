@@ -4,7 +4,7 @@ _base_ = [
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/origin'
 
 find_unused_parameters=True
 model = dict(
@@ -37,11 +37,15 @@ model = dict(
         init_cfg=None,
         
         entropy_pruning=dict(
-            enabled=True,
+            enabled=False,
+            entropy_strategy='origin',
             stages_to_prune=[2],
             block_indices=[0, 2, 4],
-            block_keep_ratio={
+            kl_ratio={
                 2: [0.8, 0.6, 0.4]
+            },
+            increment_ratio={
+                2: [0.8, 0.6]
             },
         )),
     neck=dict(
@@ -68,7 +72,7 @@ model = dict(
             self_attn_cfg=dict(embed_dims=256, num_heads=8,
                                dropout=0.0),
             cross_attn_cfg=dict(embed_dims=256, num_levels=4,
-                                dropout=0.0),
+                               dropout=0.0),
             ffn_cfg=dict(
                 embed_dims=256,
                 feedforward_channels=2048,
@@ -156,7 +160,7 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)}))
 
-max_epochs = 3
+max_epochs = 36
 train_cfg = dict(
     type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 

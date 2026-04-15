@@ -15,7 +15,8 @@ from PIL import Image
 
 from typing import List
 from sparse_former.utils.block_entropy import (
-    compute_window_relative_entropy
+    compute_window_relative_entropy,
+    compute_attention_entropy_from_features
 )
 
 
@@ -35,8 +36,10 @@ class SwinBlockEntropy(SwinBlock):
         super().__init__(*args, **kwargs)
         self.enable_entropy = False
         self.block_keep_ratio = None
+        self.kl_ratio = None
+        self.increment_ratio = None
+        self.entropy_strategy = 'kl'
         
-        # 从kwargs获取drop_path_rate并创建DropPath层
         drop_path_rate = kwargs.get('drop_path_rate', 0.)
         if drop_path_rate > 0:
             from mmdet.models.utils import build_dropout
@@ -44,33 +47,38 @@ class SwinBlockEntropy(SwinBlock):
         else:
             self.drop_path = None
     
-    def forward(self, x, hw_shape):
-        """Forward with entropy pruning
+    def forward(self, x, hw_shape, attn_entropy_cache=None):
+        """Forward with KL incremental pruning
+        
+        Supports two strategies:
+        - 'kl': Original KL-only pruning
+        - 'kl_incremental': Double-filter pruning with attention entropy cache
         
         Args:
             x: (B, L, C) input features
             hw_shape: (H, W) spatial shape
+            attn_entropy_cache: (B * N_win,) cache from previous block
+        
+        Returns:
+            x: output features
+            attn_entropy_cache: updated cache for next block
         """
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, 'input feature has wrong size'
         
-        # 保存原始shape信息
         self._B = B
         self._H = H
         self._W = W
         self._C = C
         
-        # Window partition
         x = x.view(B, H, W, C)
         
-        # Padding to multiple of window_size
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
         
-        # Cyclic shift
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
             attn_mask = self._create_attn_mask(H_pad, W_pad)
@@ -78,95 +86,142 @@ class SwinBlockEntropy(SwinBlock):
             shifted_x = x
             attn_mask = None
         
-        # Window partition: (num_windows, window_size, window_size, C)
         x_windows = self.window_partition(shifted_x)
         
-        # 计算熵并筛选
-        keep_idx_flat = None
-        if self.enable_entropy and self.shift_size == 0 and self.block_keep_ratio is not None:
-            # Step 1: 计算相对熵
-            window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
-            window_scores = window_scores.view(B, -1)  # (B, N_win)
-            
-            # Step 2: Top-K筛选
-            N_win = window_scores.shape[1]
-            k = max(1, int(N_win * self.block_keep_ratio))
-            
-            keep_scores, keep_idx = torch.topk(window_scores, k=k, dim=1)
-            keep_idx = keep_idx.sort(dim=1)[0]
-            
-            # 计算flat索引: 加batch偏移量
-            batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
-            keep_idx_flat = (keep_idx + batch_offsets).view(-1)
-            
-            self._keep_idx = keep_idx_flat
-            self._N_win = N_win
-            self._B = B
-        else:
-            self._keep_idx = None
+        total_windows = x_windows.shape[0]
+        N_win = total_windows // B
         
-        # Gather: 只取高分窗口
-        if self._keep_idx is not None:
-            x_high = x_windows[self._keep_idx]
-            mask_high = attn_mask[self._keep_idx] if attn_mask is not None else None
-        else:
-            x_high = x_windows
-            mask_high = attn_mask
+        global_window_idx = torch.arange(total_windows, device=x.device)
+        batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
         
-        # === 核心计算区: Tensor变小 ===
+        kl_keep_mask = None
+        kl_keep_flat = None
+        inc_ratio = None
         
-        # 展平为3D: (num_windows, 49, C)
-        x_high = x_high.view(-1, self.window_size * self.window_size, C)
+        if self.enable_entropy and self.shift_size == 0:
+            kl_ratio = self.kl_ratio if self.kl_ratio is not None else self.block_keep_ratio
+            
+            if kl_ratio is not None and kl_ratio > 0:
+                window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
+                window_scores = window_scores.view(B, -1)
+                
+                k = max(1, int(N_win * kl_ratio))
+                _, keep_idx = torch.topk(window_scores, k=k, dim=1)
+                keep_idx = keep_idx.sort(dim=1)[0]
+                
+                kl_keep_flat = (keep_idx + batch_offsets).view(-1)
+                
+                kl_keep_mask = torch.zeros(total_windows, dtype=torch.bool, device=x.device)
+                kl_keep_mask[kl_keep_flat] = True
+            
+            if self.entropy_strategy == 'kl_incremental' and self.increment_ratio is not None:
+                inc_ratio = self.increment_ratio
         
-        # --- (A) Attention ---
-        identity_attn = x_high
-        x_high = self.norm1(x_high)
-        x_high = self.attn.w_msa(x_high, mask=mask_high)
-        # 使用DropPath
+        x_to_attn = x_windows
+        mask_to_attn = attn_mask
+        
+        if kl_keep_mask is not None:
+            x_to_attn = x_windows[kl_keep_mask]
+            mask_to_attn = attn_mask[kl_keep_mask] if attn_mask is not None else None
+        
+        x_to_attn = x_to_attn.view(-1, self.window_size * self.window_size, C)
+        
+        identity_attn = x_to_attn
+        x_after_attn = self.norm1(x_to_attn)
+        x_after_attn = self.attn.w_msa(x_after_attn, mask=mask_to_attn)
+        
         if self.drop_path is not None:
-            x_high = identity_attn + self.drop_path(x_high)
+            x_after_attn = identity_attn + self.drop_path(x_after_attn)
         else:
-            x_high = identity_attn + x_high
+            x_after_attn = identity_attn + x_after_attn
         
-        # --- (B) FFN ---
-        identity_ffn = x_high
-        x_high = self.norm2(x_high)
-        x_high = self.ffn(x_high)
-        # 使用DropPath
-        if self.drop_path is not None:
-            x_high = identity_ffn + self.drop_path(x_high)
+        cur_entropy = compute_attention_entropy_from_features(x_after_attn)
+        
+        if attn_entropy_cache is None:
+            attn_entropy_cache = torch.zeros(total_windows, device=x.device)
+        
+        if kl_keep_mask is not None and self.entropy_strategy == 'kl_incremental' and self.increment_ratio is not None:
+            # 使用 kl_keep_flat 索引更直接
+            cached_entropy = attn_entropy_cache[kl_keep_flat]
+            inc_scores = torch.abs(cur_entropy - cached_entropy)
+            
+            # 按Batch解耦计算Top-K，防止串图
+            num_kept_total = inc_scores.shape[0]
+            k_kl = num_kept_total // B
+            inc_scores_batch = inc_scores.view(B, k_kl)
+            
+            inc_k = max(1, int(k_kl * inc_ratio))
+            
+            _, inc_topk_idx_local = torch.topk(inc_scores_batch, k=inc_k, dim=1)
+            inc_topk_idx_local = inc_topk_idx_local.sort(dim=1)[0]
+            
+            inc_batch_offsets = (torch.arange(B, device=x.device) * k_kl).unsqueeze(1)
+            inc_topk_idx_flat = (inc_topk_idx_local + inc_batch_offsets).view(-1)
+            
+            # 从attention结果中提取精英进入FFN
+            x_ffn_input = x_after_attn[inc_topk_idx_flat]
+            identity_ffn = x_ffn_input
+            x_ffn_input = self.norm2(x_ffn_input)
+            x_ffn_input = self.ffn(x_ffn_input)
+            
+            if self.drop_path is not None:
+                x_ffn_input = identity_ffn + self.drop_path(x_ffn_input)
+            else:
+                x_ffn_input = identity_ffn + x_ffn_input
+            
+            new_entropy = compute_attention_entropy_from_features(x_ffn_input)
+            
+            # 更新缓存：kl_keep_flat是所有过KL关的绝对索引，提取其中过FFN的那些
+            final_keep_absolute_idx = kl_keep_flat[inc_topk_idx_flat]
+            attn_entropy_cache[final_keep_absolute_idx] = new_entropy
+            
+            # 双重Scatter回填
+            x_windows_processed = x_windows.clone()
+            
+            attn_output_windows = x_after_attn.clone().view(-1, self.window_size, self.window_size, C)
+            ffn_output_windows = x_ffn_input.view(-1, self.window_size, self.window_size, C)
+            
+            # 退栈1: FFN结果 -> Attn输出
+            attn_output_windows[inc_topk_idx_flat] = ffn_output_windows
+            # 退栈2: Attn输出 -> 全图
+            x_windows_processed[kl_keep_flat] = attn_output_windows
         else:
-            x_high = identity_ffn + x_high
-        x_high = identity_ffn + x_high
-        
-        # === 核心计算区结束 ===
-        
-        # Scatter: 拼回全图
-        if self._keep_idx is not None:
-            # 用clone()避免in-place错误: 低分窗口保持最初始的identity
+            identity_ffn = x_after_attn
+            x_after_ffn = self.norm2(x_after_attn)
+            x_after_ffn = self.ffn(x_after_ffn)
+            
+            if self.drop_path is not None:
+                x_after_ffn = identity_ffn + self.drop_path(x_after_ffn)
+            else:
+                x_after_ffn = identity_ffn + x_after_ffn
+            
+            if kl_keep_mask is not None:
+                attn_entropy_cache[kl_keep_mask] = compute_attention_entropy_from_features(x_after_ffn)
+            
             x_windows_new = x_windows.clone()
-            x_high_reshaped = x_high.view(-1, self.window_size, self.window_size, C)
-            x_windows_new[self._keep_idx] = x_high_reshaped
-        else:
-            x_windows_new = x_high.view(-1, self.window_size, self.window_size, C)
+            x_high_reshaped = x_after_ffn.view(-1, self.window_size, self.window_size, C)
+            
+            if kl_keep_flat is not None:
+                x_windows_new[kl_keep_flat] = x_high_reshaped
+            else:
+                x_windows_new = x_windows_new
+            
+            x_windows_processed = x_windows_new
         
-        # Window reverse
-        attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
+        attn_windows = x_windows_processed.view(-1, self.window_size, self.window_size, C)
         shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
         
-        # Reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
         
-        # Unpad
         if pad_r > 0 or pad_b:
             x = x[:, :H, :W, :].contiguous()
         
         x = x.view(B, H * W, C)
         
-        return x
+        return x, attn_entropy_cache
     
     def _create_attn_mask(self, H_pad, W_pad):
         """Create attention mask for SW-MSA"""
@@ -254,9 +309,19 @@ class SwinTransformerEntropy(SwinTransformer):
         self.entropy_enabled = self.entropy_pruning_cfg.get('enabled', True)
         self.entropy_stages = self.entropy_pruning_cfg.get('stages_to_prune', [2])
         self.prune_block_indices = self.entropy_pruning_cfg.get('block_indices', [0, 2, 4])
-        self.block_keep_ratio = self.entropy_pruning_cfg.get('block_keep_ratio', {
-            2: [0.7, 0.5, 0.3]
-        })
+        self.entropy_strategy = self.entropy_pruning_cfg.get('entropy_strategy', 'kl')
+        
+        if self.entropy_strategy == 'kl_incremental':
+            self.kl_ratio_cfg = self.entropy_pruning_cfg.get('kl_ratio', {
+                2: [0.7, 0.5, 0.3]
+            })
+            self.increment_ratio_cfg = self.entropy_pruning_cfg.get('increment_ratio', {
+                2: [0.8, 0.8]
+            })
+        else:
+            self.block_keep_ratio = self.entropy_pruning_cfg.get('block_keep_ratio', {
+                2: [0.7, 0.5, 0.3]
+            })
         
         self._depths = depths
         
@@ -299,7 +364,13 @@ class SwinTransformerEntropy(SwinTransformer):
                 continue
             
             stage = self.stages[stage_idx]
-            ratios = self.block_keep_ratio.get(stage_idx, [0.7])
+            
+            if self.entropy_strategy == 'kl_incremental':
+                kl_ratios = self.kl_ratio_cfg.get(stage_idx, [0.7, 0.5, 0.3])
+                inc_ratios = self.increment_ratio_cfg.get(stage_idx, [0.8, 0.8])
+                ratios = kl_ratios
+            else:
+                ratios = self.block_keep_ratio.get(stage_idx, [0.7])
             
             for block_idx, block in enumerate(stage.blocks):
                 if block_idx in self.prune_block_indices:
@@ -344,7 +415,18 @@ class SwinTransformerEntropy(SwinTransformer):
                     
                     # 设置entropy参数
                     new_block.enable_entropy = True
-                    new_block.block_keep_ratio = ratios[block_idx] if block_idx < len(ratios) else ratios[-1]
+                    new_block.entropy_strategy = self.entropy_strategy
+                    
+                    if self.entropy_strategy == 'kl_incremental':
+                        new_block.kl_ratio = ratios[block_idx] if block_idx < len(ratios) else ratios[-1]
+                        if block_idx in [2, 4]:
+                            new_block.increment_ratio = inc_ratios[block_idx - 2] if (block_idx - 2) < len(inc_ratios) else inc_ratios[-1]
+                        else:
+                            new_block.increment_ratio = None
+                    else:
+                        new_block.block_keep_ratio = ratios[block_idx] if block_idx < len(ratios) else ratios[-1]
+                        new_block.kl_ratio = None
+                        new_block.increment_ratio = None
                     
                     # 替换
                     stage.blocks[block_idx] = new_block
@@ -378,14 +460,29 @@ class SwinTransformerEntropy(SwinTransformer):
         """Forward stage with entropy-based window pruning"""
         depth = self._depths[stage_idx]
         stage_blocks = stage.blocks
-        ratios = self.block_keep_ratio.get(stage_idx, [0.7])
+        
+        if self.entropy_strategy == 'kl_incremental':
+            kl_ratios = self.kl_ratio_cfg.get(stage_idx, [0.7, 0.5, 0.3])
+            inc_ratios = self.increment_ratio_cfg.get(stage_idx, [0.8, 0.8])
+        else:
+            ratios = self.block_keep_ratio.get(stage_idx, [0.7])
+        
+        attn_entropy_cache = None
         
         for block_idx in range(depth):
             block = stage_blocks[block_idx]
             
             if block_idx in self.prune_block_indices:
-                block.block_keep_ratio = ratios[block_idx] if block_idx < len(ratios) else ratios[-1]
-                x = block(x, hw_shape)
+                if self.entropy_strategy == 'kl_incremental':
+                    block.kl_ratio = kl_ratios[block_idx] if block_idx < len(kl_ratios) else kl_ratios[-1]
+                    if block_idx in [2, 4]:
+                        block.increment_ratio = inc_ratios[block_idx - 2] if (block_idx - 2) < len(inc_ratios) else inc_ratios[-1]
+                    else:
+                        block.increment_ratio = None
+                    x, attn_entropy_cache = block(x, hw_shape, attn_entropy_cache=attn_entropy_cache)
+                else:
+                    block.block_keep_ratio = ratios[block_idx] if block_idx < len(ratios) else ratios[-1]
+                    x, _ = block(x, hw_shape)
             else:
                 x = block(x, hw_shape)
         

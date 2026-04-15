@@ -1,9 +1,29 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
 import math
 import numpy as np
 from PIL import Image
+
+
+def compute_attention_entropy_from_features(x: torch.Tensor) -> torch.Tensor:
+    """
+    从特征计算注意力熵（模拟attention分布的熵）
+    
+    Args:
+        x: (B * N_win, window_area, C) - 特征输入
+    
+    Returns:
+        entropy: (B * N_win,) - 每个window的注意力熵
+    """
+    B_N_win, area, C = x.shape
+    
+    attn = F.softmax(x, dim=-1)
+    
+    entropy = -torch.sum(attn * torch.log(attn + 1e-8), dim=-1).mean(dim=1)
+    
+    return entropy
 
 
 def compute_window_relative_entropy(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
