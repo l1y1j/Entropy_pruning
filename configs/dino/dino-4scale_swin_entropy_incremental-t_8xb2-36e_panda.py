@@ -39,7 +39,7 @@ model = dict(
         #origin/kl/kl_incremental/incremental_only
         entropy_pruning=dict(
             enabled=True,
-            entropy_strategy='origin',
+            entropy_strategy='kl',
             stages_to_prune=[2],
             block_indices=[0, 2, 4],
             kl_ratio={

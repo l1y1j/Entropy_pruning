@@ -131,3 +131,4 @@ local-*/*
 .conda/*
 outputs/
 pretrained_model/
+entropy_pruning.tar.gz

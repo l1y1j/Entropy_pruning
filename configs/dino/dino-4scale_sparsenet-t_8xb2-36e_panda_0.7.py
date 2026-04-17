@@ -3,7 +3,8 @@ _base_ = [
 ]
 
 # pretrained = 'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa
-pretrained = '/home/liwenxi/mmdetection/giga_tiny_global.pth'  # noqa
+# pretrained = '/home/liwenxi/mmdetection/giga_tiny_global.pth'  # noqa
+pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
 find_unused_parameters=True
 model = dict(
