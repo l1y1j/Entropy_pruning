@@ -13,6 +13,10 @@ from mmengine.runner import Runner
 
 from mmdet.registry import MODELS
 
+# Import sparse_former modules to register datasets
+from sparse_former.datasets import *  # noqa: F401, F403
+from sparse_former.models import *  # noqa: F401, F403
+
 try:
     from mmengine.analysis import get_model_complexity_info
     from mmengine.analysis.print_helper import _format_size

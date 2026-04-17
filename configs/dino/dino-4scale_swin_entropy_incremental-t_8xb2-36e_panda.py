@@ -4,7 +4,7 @@ _base_ = [
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/origin'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/1'
 
 find_unused_parameters=True
 model = dict(
@@ -36,8 +36,9 @@ model = dict(
         convert_weights=True,
         init_cfg=None,
         
+        #origin/kl/kl_incremental/incremental_only
         entropy_pruning=dict(
-            enabled=False,
+            enabled=True,
             entropy_strategy='origin',
             stages_to_prune=[2],
             block_indices=[0, 2, 4],
@@ -45,7 +46,7 @@ model = dict(
                 2: [0.8, 0.6, 0.4]
             },
             increment_ratio={
-                2: [0.8, 0.6]
+                2: [0.5, 0.3]
             },
         )),
     neck=dict(
