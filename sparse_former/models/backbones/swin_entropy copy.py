@@ -78,10 +78,6 @@ class SwinBlockEntropy(SwinBlock):
             x: 输出特征
             attn_entropy_cache: 更新后的熵缓存，仅kl_incremental策略返回值有意义
         """
-        # 对于origin策略，直接调用父类SwinBlock的forward
-        if not self.enable_entropy:
-            return super().forward(x, hw_shape), attn_entropy_cache
-
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, 'input feature has wrong size'
@@ -132,9 +128,6 @@ class SwinBlockEntropy(SwinBlock):
                 # Gather筛选后的窗口
                 x_to_attn = x_windows[kl_keep_flat]
                 mask_to_attn = attn_mask[kl_keep_flat] if attn_mask is not None else None
-            else:
-                # kl_ratio异常，调用父类
-                return super().forward(x, hw_shape), attn_entropy_cache
 
         x_to_attn = x_to_attn.view(-1, self.window_size * self.window_size, C)
 
@@ -159,6 +152,7 @@ class SwinBlockEntropy(SwinBlock):
         # 策略分支：决定如何处理Attention输出
         # ============================================
         if self.enable_entropy and self.shift_size == 0:
+            print(f"[Forward] strategy={self.entropy_strategy}, kl_ratio={self.kl_ratio}, inc_ratio={self.increment_ratio}, kl_keep_flat={kl_keep_flat is not None}")
             if self.entropy_strategy == 'incremental_only' and self.increment_ratio is not None:
                 # ---------- incremental_only: 无KL预筛选，直接增量筛选 ----------
                 x_windows_processed = self._forward_incremental_only(

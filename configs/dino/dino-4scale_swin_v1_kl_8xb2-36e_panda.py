@@ -4,7 +4,7 @@ _base_ = [
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v1_kl'
 
 find_unused_parameters=True
 model = dict(
@@ -19,7 +19,7 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=1),
     backbone=dict(
-        type='SwinTransformerEntropy',
+        type='SwinTransformerV1',
         embed_dims=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
@@ -34,17 +34,23 @@ model = dict(
         out_indices=(1, 2, 3),
         with_cp=False,
         convert_weights=True,
-        init_cfg=None,
+        init_cfg=dict(type='Pretrained', checkpoint=pretrained),
         
-        entropy_pruning=dict(
-            enabled=True,
-            entropy_strategy='kl',
-            kl_stages_to_prune=[2],
-            block_indices=[0, 2, 4],
-            kl_ratio={
-                2: [0.8, 0.6, 0.4]
-            },
-        )),
+        # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
+        strategy='kl_inc',
+        
+        # KL 策略配置（strategy='kl' 时生效）
+        stage_config={
+            0: {'blocks': [0], 'ratio': 1},
+            1: {'blocks': [0], 'ratio': 1},
+            2: {'blocks': [0, 2, 4], 'ratio': [0.1, 0.1, 0.1]},
+            3: {'blocks': [0], 'ratio': 1},
+        },
+        
+        # 增量策略配置（strategy='inc' 时生效）
+        inc_stage_config={
+            2: {'blocks': [2, 4], 'inc_ratio': [0.1, 0.1]},
+        }),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],
@@ -69,7 +75,7 @@ model = dict(
             self_attn_cfg=dict(embed_dims=256, num_heads=8,
                                dropout=0.0),
             cross_attn_cfg=dict(embed_dims=256, num_levels=4,
-                                dropout=0.0),
+                               dropout=0.0),
             ffn_cfg=dict(
                 embed_dims=256,
                 feedforward_channels=2048,
@@ -157,7 +163,7 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)}))
 
-max_epochs = 3
+max_epochs = 36
 train_cfg = dict(
     type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 

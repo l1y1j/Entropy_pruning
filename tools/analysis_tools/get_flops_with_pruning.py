@@ -98,12 +98,14 @@ def calculate_pruned_flops(base_flops, backbone_cfg, entropy_cfg):
     entropy_enabled = entropy_cfg.get('enabled', False)
     entropy_strategy = entropy_cfg.get('entropy_strategy', 'kl')
 
-    if not entropy_enabled or not entropy_cfg.get('stages_to_prune'):
+    kl_stages = entropy_cfg.get('kl_stages_to_prune', [2])
+    inc_stages = entropy_cfg.get('inc_stages_to_prune', [2])
+
+    if not entropy_enabled or (not kl_stages and not inc_stages):
         return base_flops, 1.0, ['No pruning enabled']
 
     depths = backbone_cfg.get('depths', [2, 2, 6, 2])
-    stages_to_prune = entropy_cfg.get('stages_to_prune', [])
-    block_indices = entropy_cfg.get('block_indices', [])
+    block_indices = entropy_cfg.get('block_indices', [0, 2, 4])
     kl_ratio_cfg = entropy_cfg.get('kl_ratio', {})
     inc_ratio_cfg = entropy_cfg.get('increment_ratio', {})
 
@@ -131,8 +133,11 @@ def calculate_pruned_flops(base_flops, backbone_cfg, entropy_cfg):
 
         stage_pruned_flops = 0.0
 
-        # Check if this stage has pruning blocks
-        if stage_idx in stages_to_prune:
+        # Check if this stage has pruning enabled
+        use_kl = stage_idx in kl_stages
+        use_inc = stage_idx in inc_stages
+
+        if use_kl or use_inc:
             kl_ratios = kl_ratio_cfg.get(stage_idx, [])
             inc_ratios = inc_ratio_cfg.get(stage_idx, [])
 
@@ -140,27 +145,26 @@ def calculate_pruned_flops(base_flops, backbone_cfg, entropy_cfg):
             valid_blocks = [b for b in block_indices if b < stage_depth]
 
             for i, block_idx in enumerate(valid_blocks):
-                kl_ratio = kl_ratios[i] if i < len(kl_ratios) else 1.0
+                kl_ratio = kl_ratios[i] if (use_kl and i < len(kl_ratios)) else 1.0
+
+                if use_inc and block_idx > 0:
+                    inc_idx = i - 1
+                    inc_ratio = inc_ratios[inc_idx] if inc_idx < len(inc_ratios) else 1.0
+                else:
+                    inc_ratio = 1.0
 
                 if entropy_strategy == 'kl_incremental':
-                    # Incremental only affects FFN (after KL filtering)
-                    # block_idx=0: no incremental, inc_ratio=1.0
-                    # block_idx=2: inc_ratios[0] (first in list)
-                    # block_idx=4: inc_ratios[1] (second in list)
-                    if block_idx == 0:
-                        inc_ratio = 1.0
-                    else:
-                        inc_idx = i - 1  # block_idx=2 -> inc_idx=0, block_idx=4 -> inc_idx=1
-                        inc_ratio = inc_ratios[inc_idx] if inc_idx < len(inc_ratios) else 1.0
-                    # KL affects both Attn and FFN, increment only affects FFN
                     block_factor = ATTN_RATIO * kl_ratio + FFN_RATIO * kl_ratio * inc_ratio
                     detail = (f"Stage{stage_idx}/Block{block_idx}: "
                               f"KL={kl_ratio}, Inc={inc_ratio}, "
                               f"factor={block_factor:.3f}")
-                else:
-                    # KL affects both Attn and FFN equally
+                elif entropy_strategy == 'kl':
                     block_factor = kl_ratio
                     detail = f"Stage{stage_idx}/Block{block_idx}: KL={kl_ratio}, factor={block_factor:.3f}"
+                else:
+                    # incremental_only
+                    block_factor = inc_ratio
+                    detail = f"Stage{stage_idx}/Block{block_idx}: Inc={inc_ratio}, factor={block_factor:.3f}"
 
                 block_pruned_flops = flops_per_block * block_factor
                 stage_pruned_flops += block_pruned_flops

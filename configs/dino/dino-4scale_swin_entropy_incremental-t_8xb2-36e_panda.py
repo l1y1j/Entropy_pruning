@@ -40,13 +40,10 @@ model = dict(
         entropy_pruning=dict(
             enabled=True,
             entropy_strategy='kl',
-            stages_to_prune=[2],
-            block_indices=[0, 2, 4],
+            stages_to_prune=[0],
+            block_indices=[0],
             kl_ratio={
-                2: [0.8, 0.6, 0.4]
-            },
-            increment_ratio={
-                2: [0.5, 0.3]
+                0: [0.8],
             },
         )),
     neck=dict(
