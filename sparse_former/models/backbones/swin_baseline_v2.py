@@ -12,70 +12,70 @@ from mmdet.models.backbones.swin import (
 
 
 # KL分数收集器（只收集前10张图）
-_kl_img_counter = 0
-_kl_img_limit = 10
-_kl_scores_collector = []
+_kl_img_counter_v2 = 0
+_kl_img_limit_v2 = 10
+_kl_scores_collector_v2 = []
 
 
-def _collect_kl_scores(window_scores):
+def _collect_kl_scores_v2(window_scores):
     """收集KL分数用于后续分析"""
-    global _kl_img_counter, _kl_img_limit, _kl_scores_collector
-    if _kl_img_counter < _kl_img_limit:
+    global _kl_img_counter_v2, _kl_img_limit_v2, _kl_scores_collector_v2
+    if _kl_img_counter_v2 < _kl_img_limit_v2:
         # 保存为字典，包含shape信息
-        _kl_scores_collector.append({
+        _kl_scores_collector_v2.append({
             'data': window_scores.detach().cpu().numpy(),
             'shape': window_scores.shape
         })
-        _kl_img_counter += 1
-        print(f"[DEBUG] Collected KL scores from image {_kl_img_counter}/{_kl_img_limit}")
-    if _kl_img_counter >= _kl_img_limit and len(_kl_scores_collector) > 0:
-        _export_kl_scores()
+        _kl_img_counter_v2 += 1
+        print(f"[DEBUG] Collected KL scores from image {_kl_img_counter_v2}/{_kl_img_limit_v2}")
+    if _kl_img_counter_v2 >= _kl_img_limit_v2 and len(_kl_scores_collector_v2) > 0:
+        _export_kl_scores_v2()
 
 
-def _export_kl_scores():
+def _export_kl_scores_v2():
     """导出收集的KL分数到文件"""
-    global _kl_scores_collector
-    if _kl_scores_collector:
-        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export')
+    global _kl_scores_collector_v2
+    if _kl_scores_collector_v2:
+        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export_v2')
         os.makedirs(export_dir, exist_ok=True)
         save_path = os.path.join(export_dir, "kl_scores_10imgs.pkl")
 
         # 用字典保存，包含所有batch的shape和数据
         import pickle
         with open(save_path, 'wb') as f:
-            pickle.dump(_kl_scores_collector, f)
+            pickle.dump(_kl_scores_collector_v2, f)
 
-        shapes = [item['shape'] for item in _kl_scores_collector]
-        print(f"[DEBUG] Exported {len(_kl_scores_collector)} batches KL to {save_path}")
+        shapes = [item['shape'] for item in _kl_scores_collector_v2]
+        print(f"[DEBUG] Exported {len(_kl_scores_collector_v2)} batches KL to {save_path}")
         print(f"[DEBUG] Shapes: {shapes}")
-        _kl_scores_collector.clear()
+        _kl_scores_collector_v2.clear()
 
 
-def compute_window_relative_entropy(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
+def compute_window_relative_entropy_v2(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
     """Compute KL divergence for each window
-    
+
     Args:
         x_windows: (total_windows, window_size, window_size, C)
         B: batch size
         window_size: window size
-    
+
     Returns:
         kl: (B * N_win,) KL score for each window
     """
     total_windows, _, _, C = x_windows.shape
     N_win = total_windows // B
-    
+
     x_windows = x_windows.view(B, N_win, window_size * window_size, C)
     local_dist = F.softmax(x_windows.mean(dim=2), dim=-1)
     global_dist = local_dist.mean(dim=1, keepdim=True)
     kl = (local_dist * torch.log(local_dist / (global_dist + 1e-8))).sum(dim=-1)
-    
+
     return kl.view(-1)
 
 
-class SwinBlockV1(nn.Module):
+class SwinBlockV2(nn.Module):
     """Swin Block with optional KL pruning (Cross-Layer Design)"""
-    
+
     def __init__(
         self,
         embed_dims: int,
@@ -96,7 +96,7 @@ class SwinBlockV1(nn.Module):
         strategy: str = None,
     ):
         super().__init__()
-        
+
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.window_size = window_size
@@ -105,10 +105,10 @@ class SwinBlockV1(nn.Module):
         self.kl_ratio = kl_ratio
         self.inc_ratio = inc_ratio
         self.strategy = strategy
-        
+
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
-        
+
         self.attn = ShiftWindowMSA(
             embed_dims=embed_dims,
             num_heads=num_heads,
@@ -120,7 +120,7 @@ class SwinBlockV1(nn.Module):
             proj_drop_rate=drop_rate,
             dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
             init_cfg=None)
-        
+
         from mmcv.cnn.bricks.transformer import FFN
         self.ffn = FFN(
             embed_dims=embed_dims,
@@ -131,18 +131,18 @@ class SwinBlockV1(nn.Module):
             act_cfg=act_cfg,
             add_identity=True,
             init_cfg=None)
-    
+
     def forward(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None) -> tuple:
         """Forward function"""
         can_prune_kl = self.kl_ratio is not None and self.kl_ratio < 1.0
         can_prune_inc = self.inc_ratio is not None and self.inc_ratio < 1.0
-        
+
         if self.shift_size > 0:
             return self._forward_base(x, hw_shape), None
-        
+
         if not can_prune_kl and not can_prune_inc:
             return self._forward_base(x, hw_shape), None
-        
+
         if self.strategy is not None:
             if self.strategy == 'kl_inc' and can_prune_kl and can_prune_inc:
                 return self._forward_kl_inc(x, hw_shape, entropy_cache)
@@ -150,86 +150,86 @@ class SwinBlockV1(nn.Module):
                 return self._forward_kl(x, hw_shape)
             elif self.strategy in ['inc', 'kl_inc'] and can_prune_inc:
                 return self._forward_inc(x, hw_shape, entropy_cache)
-        
+
         return self._forward_base(x, hw_shape), None
-    
+
     def _forward_base(self, x: torch.Tensor, hw_shape: tuple) -> torch.Tensor:
         """Base forward without pruning"""
         B, L, C = x.shape
         H, W = hw_shape
-        
+
         identity = x
         x = self.norm1(x)
         x = self.attn(x, hw_shape)
         x = x + identity
-        
+
         identity = x
         x = self.norm2(x)
         x = self.ffn(x, identity=identity)
-        
+
         return x
-    
+
     def _forward_kl(self, x: torch.Tensor, hw_shape: tuple) -> tuple:
         """KL pruning forward"""
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, f'Input size mismatch: {L} vs {H}*{W}'
-        
+
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-        
+
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
-        
+
         if self.shift_size > 0 or self.kl_ratio is None:
             return self._forward_base_with_pad(x, hw_shape, pad_r, pad_b), None
-        
-        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
+
+        window_scores = compute_window_relative_entropy_v2(x_windows, B, self.window_size)
         window_scores = window_scores.view(B, -1)
-        _collect_kl_scores(window_scores)
-        
+        _collect_kl_scores_v2(window_scores)
+
         k = max(1, int(N_win * self.kl_ratio))
         _, keep_idx = torch.topk(window_scores, k=k, dim=1)
         keep_idx = keep_idx.sort(dim=1)[0]
-        
+
         batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
         keep_idx_flat = (keep_idx + batch_offsets).view(-1)
-        
+
         x_to_attn = x_windows[keep_idx_flat]
         x_to_attn = x_to_attn.view(-1, self.window_size * self.window_size, C)
-        
+
         identity_attn = x_to_attn
         x_after_attn = self.norm1(x_to_attn)
         x_after_attn = self.attn.w_msa(x_after_attn)
         x_after_attn = identity_attn + x_after_attn
-        
+
         cur_entropy_local = self._compute_entropy(x_after_attn)
         full_entropy = torch.zeros(total_windows, device=x.device)
         full_entropy[keep_idx_flat] = cur_entropy_local.detach()
-        
+
         identity_ffn = x_after_attn
         x_after_ffn = self.norm2(x_after_attn)
         x_after_ffn = self.ffn(x_after_ffn)
         x_after_ffn = identity_ffn + x_after_ffn
-        
+
         x_windows_new = x_windows.clone()
         x_ffn_reshaped = x_after_ffn.view(-1, self.window_size, self.window_size, C)
         x_windows_new[keep_idx_flat] = x_ffn_reshaped
-        
+
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-        
+
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        
+
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
-        
+
         return x, full_entropy
 
     def _forward_inc(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None) -> tuple:
@@ -237,141 +237,141 @@ class SwinBlockV1(nn.Module):
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, f'Input size mismatch: {L} vs {H}*{W}'
-        
+
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-        
+
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
-        
+
         if self.shift_size > 0 or self.inc_ratio is None:
             return self._forward_base_with_pad(x, hw_shape, pad_r, pad_b), None
-        
+
         x_windows_flat = x_windows.view(-1, self.window_size * self.window_size, C)
         identity_attn = x_windows_flat
         x_after_attn = self.norm1(x_windows_flat)
         x_after_attn = self.attn.w_msa(x_after_attn)
         x_after_attn = identity_attn + x_after_attn
-        
+
         cur_entropy = self._compute_entropy(x_after_attn)
-        
+
         if entropy_cache is None or entropy_cache.shape[0] != total_windows:
             inc_scores = torch.zeros_like(cur_entropy)
         else:
             inc_scores = torch.abs(cur_entropy - entropy_cache.detach())
         inc_scores = inc_scores.view(B, -1)
-        
+
         k = max(1, int(N_win * self.inc_ratio))
         _, inc_keep_idx = torch.topk(inc_scores, k=k, dim=1)
         inc_keep_idx = inc_keep_idx.sort(dim=1)[0]
-        
+
         batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
         inc_keep_idx_flat = (inc_keep_idx + batch_offsets).view(-1)
-        
+
         x_ffn_input = x_after_attn[inc_keep_idx_flat]
         identity_ffn = x_ffn_input
         x_ffn_input = self.norm2(x_ffn_input)
         x_ffn_input = self.ffn(x_ffn_input)
         x_ffn_input = identity_ffn + x_ffn_input
-        
+
         x_windows_new = x_windows.clone()
         x_windows_new_reshaped = x_ffn_input.view(-1, self.window_size, self.window_size, C)
         x_windows_new[inc_keep_idx_flat] = x_windows_new_reshaped
-        
+
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-        
+
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
-        
+
         return x, cur_entropy.detach()
 
     def _forward_kl_inc(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None) -> tuple:
         """KL + INC 串联筛选 with cross-layer comparison"""
         if self.inc_ratio is None:
             return self._forward_kl(x, hw_shape)
-        
+
         B, L, C = x.shape
         H, W = hw_shape
         x = x.view(B, H, W, C)
-        
+
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-        
+
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
         batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
-        
+
         if self.shift_size > 0 or self.kl_ratio is None:
             return self._forward_base_with_pad(x, hw_shape, pad_r, pad_b), None
-        
-        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
+
+        window_scores = compute_window_relative_entropy_v2(x_windows, B, self.window_size)
         window_scores = window_scores.view(B, -1)
-        _collect_kl_scores(window_scores)
-        
+        _collect_kl_scores_v2(window_scores)
+
         k_kl = max(1, int(N_win * self.kl_ratio))
         _, kl_keep_idx = torch.topk(window_scores, k=k_kl, dim=1)
         kl_keep_idx = kl_keep_idx.sort(dim=1)[0]
-        
+
         kl_keep_idx_flat = (kl_keep_idx + batch_offsets).view(-1)
-        
+
         x_kl = x_windows[kl_keep_idx_flat]
         x_kl = x_kl.view(-1, self.window_size * self.window_size, C)
         identity_attn = x_kl
         x_kl = self.norm1(x_kl)
         x_kl = self.attn.w_msa(x_kl)
         x_kl = identity_attn + x_kl
-        
+
         cur_entropy = self._compute_entropy(x_kl)
-        
+
         if entropy_cache is None or entropy_cache.shape[0] != total_windows:
             inc_scores = torch.zeros_like(cur_entropy)
         else:
             inc_scores = torch.abs(cur_entropy - entropy_cache[kl_keep_idx_flat].detach())
         inc_scores = inc_scores.view(B, -1)
-        
+
         k_inc = max(1, int(k_kl * self.inc_ratio))
         _, inc_keep_idx = torch.topk(inc_scores, k=k_inc, dim=1)
         inc_keep_idx = inc_keep_idx.sort(dim=1)[0]
-        
+
         kl_batch_offsets = (torch.arange(B, device=x.device) * k_kl).unsqueeze(1)
         inc_keep_idx_flat = (inc_keep_idx + kl_batch_offsets).view(-1)
-        
+
         x_ffn_input = x_kl[inc_keep_idx_flat]
         identity_ffn = x_ffn_input
         x_ffn_input = self.norm2(x_ffn_input)
         x_ffn_input = self.ffn(x_ffn_input)
         x_ffn_input = identity_ffn + x_ffn_input
-        
+
         x_windows_new = x_windows.clone()
         x_kl_reshaped = x_kl.view(-1, self.window_size, self.window_size, C)
         x_windows_new[kl_keep_idx_flat] = x_kl_reshaped
-        
+
         x_ffn_reshaped = x_ffn_input.view(-1, self.window_size, self.window_size, C)
         x_windows_new[kl_keep_idx_flat[inc_keep_idx_flat]] = x_ffn_reshaped
-        
+
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-        
+
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
-        
+
         full_entropy = torch.zeros(total_windows, device=x.device)
         full_entropy[kl_keep_idx_flat] = cur_entropy.detach()
-        
+
         return x, full_entropy
 
     def _window_partition(self, x: torch.Tensor) -> torch.Tensor:
@@ -418,9 +418,9 @@ class SwinBlockV1(nn.Module):
         return entropy
 
 
-class SwinBlockSequenceV1(nn.Module):
+class SwinBlockSequenceV2(nn.Module):
     """Swin Block Sequence with KL config
-    
+
     Args:
         embed_dims: feature dimension
         num_heads: number of attention heads
@@ -438,7 +438,7 @@ class SwinBlockSequenceV1(nn.Module):
         with_cp: use checkpoint
         block_kl_ratios: list of KL ratios for each block
     """
-    
+
     def __init__(
         self,
         embed_dims: int,
@@ -460,23 +460,23 @@ class SwinBlockSequenceV1(nn.Module):
         strategy: str = None,
     ):
         super().__init__()
-        
+
         if block_kl_ratios is None:
             block_kl_ratios = [None] * depth
         elif isinstance(block_kl_ratios, (int, float)):
             block_kl_ratios = [block_kl_ratios] * depth
-        
+
         if block_inc_ratios is None:
             block_inc_ratios = [None] * depth
         elif isinstance(block_inc_ratios, (int, float)):
             block_inc_ratios = [block_inc_ratios] * depth
-        
+
         self.blocks = nn.ModuleList()
         for i in range(depth):
             kl_ratio = block_kl_ratios[i] if i < len(block_kl_ratios) else None
             inc_ratio = block_inc_ratios[i] if i < len(block_inc_ratios) else None
-            
-            block = SwinBlockV1(
+
+            block = SwinBlockV2(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -495,16 +495,16 @@ class SwinBlockSequenceV1(nn.Module):
                 strategy=strategy,
             )
             self.blocks.append(block)
-        
+
         self.downsample = downsample
-    
+
     def forward(self, x: torch.Tensor, hw_shape: tuple):
         """Forward function
-        
+
         Args:
             x: (B, L, C) input features
             hw_shape: (H, W) spatial shape
-        
+
         Returns:
             x_down: output features after downsample
             down_hw_shape: new spatial shape
@@ -513,17 +513,17 @@ class SwinBlockSequenceV1(nn.Module):
         """
         entropy_cache = None
         prev_entropy = None
-        
+
         for i, block in enumerate(self.blocks):
             result = block(x, hw_shape, entropy_cache)
             # DEBUG: 打印每个block的shift_size和kl_ratio
-            # print(f"[DEBUG SwinBlockSequenceV1.forward] stage block {i}: shift_size={block.shift_size}, kl_ratio={getattr(block, 'kl_ratio', None)}")
+            # print(f"[DEBUG SwinBlockSequenceV2.forward] stage block {i}: shift_size={block.shift_size}, kl_ratio={getattr(block, 'kl_ratio', None)}")
             if isinstance(result, tuple):
                 x, new_entropy = result
                 if block.shift_size == 0:
                     prev_entropy = new_entropy
                 entropy_cache = prev_entropy
-        
+
         if self.downsample is not None:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
             return x_down, down_hw_shape, x, hw_shape
@@ -532,21 +532,21 @@ class SwinBlockSequenceV1(nn.Module):
 
 
 @MODELS.register_module()
-class SwinTransformerV1(SwinTransformer):
-    """Swin Transformer V1 with optional KL pruning
-    
+class SwinTransformerV2(SwinTransformer):
+    """Swin Transformer V2 with optional KL pruning
+
     Simplified implementation with two strategies:
     - 'base': No pruning, same as original Swin
     - 'kl': KL-based window pruning
-    
+
     Config:
         backbone=dict(
-            type='SwinTransformerV1',
+            type='SwinTransformerV2',
             embed_dims=96,
             depths=[2, 2, 6, 2],
             num_heads=[3, 6, 12, 24],
             window_size=7,
-            
+
             # Strategy configuration
             strategy='kl',    # 'base' or 'kl'
             stage_config={
@@ -556,7 +556,7 @@ class SwinTransformerV1(SwinTransformer):
                 3: {'blocks': [0], 'ratio': 0.8},
             }
         )
-    
+
     Args:
         pretrain_img_size: pretrain image size
         in_channels: input channels
@@ -586,7 +586,7 @@ strategy: 'base', 'kl' or 'inc'
     stage_config: stage configuration for KL
     inc_stage_config: stage configuration for incremental
     """
-    
+
     def __init__(
         self,
         pretrain_img_size: int = 224,
@@ -620,7 +620,7 @@ strategy: 'base', 'kl' or 'inc'
         self.strategy = strategy
         self.stage_config = stage_config or {}
         self.inc_stage_config = inc_stage_config or {}
-        
+
         super().__init__(
             pretrain_img_size=pretrain_img_size,
             in_channels=in_channels,
@@ -647,40 +647,40 @@ strategy: 'base', 'kl' or 'inc'
             frozen_stages=frozen_stages,
             init_cfg=init_cfg,
         )
-        
+
         if strategy == 'kl':
             self._replace_blocks_with_kl()
         elif strategy == 'inc':
             self._replace_blocks_with_inc()
         elif strategy == 'kl_inc':
             self._replace_blocks_with_kl_inc()
-    
+
     def _replace_blocks_with_kl(self):
         """Replace blocks with KL-enabled blocks"""
         from mmdet.models.layers import PatchMerging
-        
+
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-        
+
         num_layers = len(self.stages)
-        
+
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-            
+
             # Get stage config
             stage_cfg = self.stage_config.get(stage_idx, {})
             stage_blocks = stage_cfg.get('blocks', [])
             stage_ratio = stage_cfg.get('ratio', [])
-            
+
             # Convert single value to list
             if isinstance(stage_ratio, (int, float)):
                 stage_ratio = [stage_ratio]
-            
+
             if not stage_blocks:
                 continue
-            
+
             depth = len(stage.blocks)
-            
+
             # Get first block to extract dims
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
@@ -704,7 +704,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-            
+
             # Collect KL ratios for each block
             block_kl_ratios = []
             for block_idx in range(depth):
@@ -715,9 +715,9 @@ strategy: 'base', 'kl' or 'inc'
                     block_kl_ratios.append(kl_ratio)
                 else:
                     block_kl_ratios.append(None)
-            
+
             # Create new block sequence
-            new_stage = SwinBlockSequenceV1(
+            new_stage = SwinBlockSequenceV2(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -735,40 +735,40 @@ strategy: 'base', 'kl' or 'inc'
                 block_kl_ratios=block_kl_ratios,
                 strategy='kl',
             )
-            
+
             # Copy blocks' parameters
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-            
+
             new_stage.downsample = stage.downsample
-            
+
             self.stages[stage_idx] = new_stage
-    
+
     def _replace_blocks_with_inc(self):
         """Replace blocks with incremental-enabled blocks"""
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-        
+
         num_layers = len(self.stages)
-        
+
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-            
+
             stage_cfg = self.inc_stage_config.get(stage_idx, {})
             stage_blocks = stage_cfg.get('blocks', [])
             stage_inc_ratio = stage_cfg.get('inc_ratio', [])
-            
+
             if isinstance(stage_inc_ratio, (int, float)):
                 stage_inc_ratio = [stage_inc_ratio]
-            
+
             if not stage_blocks:
                 continue
-            
+
             depth = len(stage.blocks)
-            
+
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
             num_heads = first_block.attn.w_msa.num_heads
@@ -791,7 +791,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-            
+
             block_inc_ratios = []
             for block_idx in range(depth):
                 if block_idx in stage_blocks:
@@ -800,8 +800,8 @@ strategy: 'base', 'kl' or 'inc'
                     block_inc_ratios.append(inc_ratio)
                 else:
                     block_inc_ratios.append(None)
-            
-            new_stage = SwinBlockSequenceV1(
+
+            new_stage = SwinBlockSequenceV2(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -819,42 +819,42 @@ strategy: 'base', 'kl' or 'inc'
                 block_inc_ratios=block_inc_ratios,
                 strategy='inc',
             )
-            
+
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-            
+
             new_stage.downsample = stage.downsample
-            
+
             self.stages[stage_idx] = new_stage
-    
+
     def _replace_blocks_with_kl_inc(self):
         """Replace blocks with both KL and INC enabled"""
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-        
+
         num_layers = len(self.stages)
-        
+
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-            
+
             kl_stage_cfg = self.stage_config.get(stage_idx, {})
             kl_blocks = kl_stage_cfg.get('blocks', [])
             kl_ratios = kl_stage_cfg.get('ratio', [])
-            
+
             inc_stage_cfg = self.inc_stage_config.get(stage_idx, {})
             inc_blocks = inc_stage_cfg.get('blocks', [])
             inc_ratios = inc_stage_cfg.get('inc_ratio', [])
-            
+
             if isinstance(kl_ratios, (int, float)):
                 kl_ratios = [kl_ratios]
             if isinstance(inc_ratios, (int, float)):
                 inc_ratios = [inc_ratios]
-            
+
             depth = len(stage.blocks)
-            
+
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
             num_heads = first_block.attn.w_msa.num_heads
@@ -877,7 +877,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-            
+
             block_kl_ratios = []
             block_inc_ratios = []
             for block_idx in range(depth):
@@ -891,8 +891,8 @@ strategy: 'base', 'kl' or 'inc'
                     inc_ratio = inc_ratios[idx_in_inc] if idx_in_inc < len(inc_ratios) else inc_ratios[-1]
                 block_kl_ratios.append(kl_ratio)
                 block_inc_ratios.append(inc_ratio)
-            
-            new_stage = SwinBlockSequenceV1(
+
+            new_stage = SwinBlockSequenceV2(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -911,17 +911,17 @@ strategy: 'base', 'kl' or 'inc'
                 block_inc_ratios=block_inc_ratios,
                 strategy='kl_inc',
             )
-            
+
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-            
+
             new_stage.downsample = stage.downsample
-            
+
             self.stages[stage_idx] = new_stage
-    
+
     def get_strategy_config(self) -> dict:
         """Get current strategy configuration"""
         return {

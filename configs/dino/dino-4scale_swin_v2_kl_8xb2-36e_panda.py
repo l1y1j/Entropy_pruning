@@ -4,7 +4,7 @@ _base_ = [
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v1_kl'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v2_kl'
 
 find_unused_parameters=True
 model = dict(
@@ -19,7 +19,7 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=1),
     backbone=dict(
-        type='SwinTransformerV1',
+        type='SwinTransformerV2',
         embed_dims=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
@@ -35,10 +35,10 @@ model = dict(
         with_cp=False,
         convert_weights=True,
         init_cfg=dict(type='Pretrained', checkpoint=pretrained),
-        
+
         # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
         strategy='kl_inc',
-        
+
         # KL 策略配置（strategy='kl' 时生效）
         stage_config={
             0: {'blocks': [0], 'ratio': 1},
@@ -46,7 +46,7 @@ model = dict(
             2: {'blocks': [0, 2, 4], 'ratio': [0.7, 0.7, 0.7]},
             3: {'blocks': [0], 'ratio': 0.7},
         },
-        
+
         # 增量策略配置（strategy='inc' 时生效）
         inc_stage_config={
             2: {'blocks': [2, 4], 'inc_ratio': [0.7, 0.7]},
