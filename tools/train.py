@@ -11,6 +11,7 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet.utils import register_all_modules
+import sparse_former.models  # noqa: F401,F403
 
 
 def parse_args():

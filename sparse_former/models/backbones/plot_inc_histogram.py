@@ -5,14 +5,14 @@ import pickle
 import argparse
 
 
-def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=None):
-    """Plot KL histograms and cumulative curves from collected KL scores.
+def plot_inc_histograms(data_list, output_dir, stage_filter=None, threshold_data=None):
+    """Plot INC histograms and cumulative curves from collected INC scores.
 
     Args:
         data_list: List of dicts with keys: data, shape, stage_idx, block_idx, epoch, strategy
         output_dir: Directory to save plots
         stage_filter: tuple (stage_idx, block_idx) to filter data, or None for all
-        threshold_data: dict with (stage_idx, block_idx, 'kl') -> threshold value, or None
+        threshold_data: dict with (stage_idx, block_idx, 'inc') -> threshold value, or None
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -25,7 +25,7 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
         ]
         data_label = f'stage{stage_idx}_block{block_idx}'
         # Get threshold for this stage/block (stored as list of records)
-        threshold_key = (stage_idx, block_idx, 'kl')
+        threshold_key = (stage_idx, block_idx, 'inc')
         threshold_value = None
         if threshold_data is not None and threshold_key in threshold_data:
             records = threshold_data[threshold_key]
@@ -36,6 +36,10 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
         filtered_data = data_list
         data_label = 'all_stages'
         threshold_value = None
+
+    if not filtered_data:
+        print(f"No data found for filter: {stage_filter}")
+        return
 
     # Group by shape since different blocks have different window counts
     from collections import defaultdict
@@ -58,14 +62,14 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
 
         for img_idx in range(min(num_images, 10)):
             img_data = all_data[img_idx]  # each row is one image/batch
-            kl_flat = img_data.flatten()
+            inc_flat = img_data.flatten()
 
-            # Normalize KL scores
-            kl_min, kl_max = kl_flat.min(), kl_flat.max()
-            normalized_kl = (kl_flat - kl_min) / (kl_max - kl_min + 1e-8)
+            # Normalize INC scores (larger = more different = higher priority)
+            inc_min, inc_max = inc_flat.min(), inc_flat.max()
+            normalized_inc = (inc_flat - inc_min) / (inc_max - inc_min + 1e-8)
 
             # Power penalty to sharpen
-            info_mass = normalized_kl ** 1
+            info_mass = normalized_inc ** 1
 
             # Sort by info mass descending
             mass_sorted = np.sort(info_mass)[::-1]
@@ -83,21 +87,20 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
             tokens_needed_95 = token_pct[idx_95]
 
             print(f"\n  Image {img_idx}:")
-            print(f"    Total Tokens: {len(kl_flat)}")
-            print(f"    To preserve 95% of KL Mass, we only need {tokens_needed_95:.2f}% of Tokens!")
+            print(f"    Total Tokens: {len(inc_flat)}")
+            print(f"    To preserve 95% of INC Mass, we only need {tokens_needed_95:.2f}% of Tokens!")
 
             # Plot
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-            axes[0].hist(info_mass, bins=50, alpha=0.7, color='royalblue', edgecolor='black')
-            axes[0].set_title(f'Image {img_idx} - Info Mass Distribution (Normalized KL)', fontsize=12)
+            axes[0].hist(info_mass, bins=50, alpha=0.7, color='forestgreen', edgecolor='black')
+            axes[0].set_title(f'Image {img_idx} - Info Mass Distribution (Normalized INC)', fontsize=12)
             axes[0].set_xlabel('Information Mass [0, 1]')
             axes[0].set_ylabel('Token Count')
             axes[0].grid(axis='y', linestyle='--', alpha=0.6)
 
             # Add threshold line if available
             if threshold_value is not None:
-                # Convert threshold to info_mass space (normalized_kl is 0-1, info_mass is normalized_kl^2)
                 threshold_mass = threshold_value ** 2
                 axes[0].axvline(x=threshold_mass, color='red', linestyle='--', linewidth=2,
                                 label=f'Learned Threshold: {threshold_mass:.4f}')
@@ -110,18 +113,15 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
 
             # Add learned threshold as vertical line in cumulative curve
             if threshold_value is not None:
-                # threshold_value is in [0, 1] normalized space
-                # On cumulative curve, we need to find what token percentage corresponds to this threshold
-                # Tokens are sorted by info_mass descending, so threshold corresponds to
-                # the percentage of tokens with info_mass >= threshold^2
-                above_threshold = mass_sorted >= (threshold_value ** 2)
+                threshold_mass = threshold_value ** 2
+                above_threshold = mass_sorted >= threshold_mass
                 token_pct_at_threshold = (np.sum(above_threshold) / len(mass_sorted)) * 100
                 axes[1].axvline(x=token_pct_at_threshold, color='purple', linestyle='-.', linewidth=2,
                                 label=f'Learned Threshold: {token_pct_at_threshold:.1f}% tokens')
 
             axes[1].scatter([tokens_needed_95], [95], color='red', s=100, zorder=5)
 
-            axes[1].set_title(f'Image {img_idx} - Information Mass Preservation (KL)', fontsize=12)
+            axes[1].set_title(f'Image {img_idx} - Information Mass Preservation (INC)', fontsize=12)
             axes[1].set_xlabel('Percentage of Retained Tokens (%) - [Compute Cost]')
             axes[1].set_ylabel('Percentage of Retained Info Mass (%)')
             axes[1].set_xlim(0, 100)
@@ -131,16 +131,16 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
 
             plt.tight_layout()
 
-            save_path = output_dir / f'{data_label}_image_{img_idx:02d}_kl_mass_preservation.png'
+            save_path = output_dir / f'{data_label}_image_{img_idx:02d}_inc_mass_preservation.png'
             plt.savefig(save_path, dpi=150)
             print(f"    Saved plot to {save_path}")
             plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Plot KL score histograms and cumulative curves')
+    parser = argparse.ArgumentParser(description='Plot INC score histograms and cumulative curves')
     parser.add_argument('--data_path', type=str, default=None,
-                        help='Path to kl_scores.pkl file (default: auto-detect from epoch dir)')
+                        help='Path to inc_scores.pkl file (default: auto-detect from epoch dir)')
     parser.add_argument('--epoch', type=str, default='latest',
                         help='Epoch to visualize (e.g., "001", "latest")')
     parser.add_argument('--stage', type=int, default=None,
@@ -162,12 +162,12 @@ def main():
             epoch_dirs = sorted([d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith('epoch_')],
                                 key=lambda x: int(x.name.split('_')[1]))
             if epoch_dirs:
-                data_path = epoch_dirs[-1] / 'kl_scores.pkl'
+                data_path = epoch_dirs[-1] / 'inc_scores.pkl'
             else:
                 print(f"No epoch directories found in {base_dir}")
                 return
         else:
-            data_path = base_dir / f'epoch_{args.epoch}' / 'kl_scores.pkl'
+            data_path = base_dir / f'epoch_{args.epoch}' / 'inc_scores.pkl'
 
     if not data_path.exists():
         print(f"Data file not found: {data_path}")
@@ -191,14 +191,14 @@ def main():
 
     # Load threshold data if available
     threshold_data = None
-    threshold_path = data_path.parent / 'kl_thresholds.pkl'
+    threshold_path = data_path.parent / 'inc_thresholds.pkl'
     if threshold_path.exists():
         with open(threshold_path, 'rb') as f:
             threshold_data = pickle.load(f)
         print(f"Loaded threshold data: {len(threshold_data)} entries")
 
     # Plot
-    plot_kl_histograms(data_list, output_dir, stage_filter, threshold_data)
+    plot_inc_histograms(data_list, output_dir, stage_filter, threshold_data)
 
 
 if __name__ == '__main__':

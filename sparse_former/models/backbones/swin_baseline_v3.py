@@ -11,65 +11,180 @@ from mmdet.models.backbones.swin import (
 )
 
 
-# KL分数收集器（只收集前10张图）
-_kl_img_counter_v2 = 0
-_kl_img_limit_v2 = 10
-_kl_scores_collector_v2 = []
+# KL/INC 分数收集器（只收集前10张图）
+_kl_img_counter = 0
+_kl_img_limit = 10
+_kl_scores_collector = []
+
+_inc_img_counter = 0
+_inc_img_limit = 10
+_inc_scores_collector = []
+
+_current_epoch = 0
+_enabled_collections = set()  # {(stage_idx, block_idx, 'kl'), ...}
+
+# 存储每个stage/block的threshold
+_kl_threshold_collector = {}  # {(stage_idx, block_idx): [threshold_values]}
+_inc_threshold_collector = {}
 
 
-def _collect_kl_scores_v2(window_scores):
+def _collect_kl_scores(window_scores, stage_idx, block_idx):
     """收集KL分数用于后续分析"""
-    global _kl_img_counter_v2, _kl_img_limit_v2, _kl_scores_collector_v2
-    if _kl_img_counter_v2 < _kl_img_limit_v2:
-        # 保存为字典，包含shape信息
-        _kl_scores_collector_v2.append({
+    global _kl_img_counter, _kl_img_limit, _kl_scores_collector, _current_epoch
+    key = (stage_idx, block_idx, 'kl')
+    if key not in _enabled_collections:
+        return
+    if _kl_img_counter < _kl_img_limit:
+        _kl_scores_collector.append({
             'data': window_scores.detach().cpu().numpy(),
-            'shape': window_scores.shape
+            'shape': window_scores.shape,
+            'stage_idx': stage_idx,
+            'block_idx': block_idx,
+            'epoch': _current_epoch,
+            'strategy': 'kl'
         })
-        _kl_img_counter_v2 += 1
-        print(f"[DEBUG] Collected KL scores from image {_kl_img_counter_v2}/{_kl_img_limit_v2}")
-    if _kl_img_counter_v2 >= _kl_img_limit_v2 and len(_kl_scores_collector_v2) > 0:
-        _export_kl_scores_v2()
+        _kl_img_counter += 1
+
+    if _kl_img_counter >= _kl_img_limit and len(_kl_scores_collector) > 0:
+        _export_kl_scores()
 
 
-def _export_kl_scores_v2():
+def _collect_inc_scores(inc_scores, stage_idx, block_idx):
+    """收集INC分数用于后续分析"""
+    global _inc_img_counter, _inc_img_limit, _inc_scores_collector, _current_epoch
+    key = (stage_idx, block_idx, 'inc')
+    if key not in _enabled_collections:
+        return
+    if _inc_img_counter < _inc_img_limit:
+        _inc_scores_collector.append({
+            'data': inc_scores.detach().cpu().numpy(),
+            'shape': inc_scores.shape,
+            'stage_idx': stage_idx,
+            'block_idx': block_idx,
+            'epoch': _current_epoch,
+            'strategy': 'inc'
+        })
+        _inc_img_counter += 1
+
+    if _inc_img_counter >= _inc_img_limit and len(_inc_scores_collector) > 0:
+        _export_inc_scores()
+
+
+def collect_threshold(threshold_value, stage_idx, block_idx, strategy):
+    """收集每个stage/block的threshold用于后续分析"""
+    global _current_epoch
+    key = (stage_idx, block_idx, strategy)
+    if key not in _enabled_collections:
+        return
+    if strategy == 'kl':
+        if key not in _kl_threshold_collector:
+            _kl_threshold_collector[key] = []
+        _kl_threshold_collector[key].append({
+            'threshold': float(threshold_value),
+            'stage_idx': stage_idx,
+            'block_idx': block_idx,
+            'epoch': _current_epoch
+        })
+    elif strategy == 'inc':
+        if key not in _inc_threshold_collector:
+            _inc_threshold_collector[key] = []
+        _inc_threshold_collector[key].append({
+            'threshold': float(threshold_value),
+            'stage_idx': stage_idx,
+            'block_idx': block_idx,
+            'epoch': _current_epoch
+        })
+
+
+def _export_kl_scores():
     """导出收集的KL分数到文件"""
-    global _kl_scores_collector_v2
-    if _kl_scores_collector_v2:
-        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export_v2')
+    global _kl_scores_collector, _current_epoch, _kl_threshold_collector
+    if _kl_scores_collector:
+        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export', f'epoch_{_current_epoch:03d}')
         os.makedirs(export_dir, exist_ok=True)
-        save_path = os.path.join(export_dir, "kl_scores_10imgs.pkl")
+        save_path = os.path.join(export_dir, 'kl_scores.pkl')
 
-        # 用字典保存，包含所有batch的shape和数据
         import pickle
         with open(save_path, 'wb') as f:
-            pickle.dump(_kl_scores_collector_v2, f)
+            pickle.dump(_kl_scores_collector, f)
 
-        shapes = [item['shape'] for item in _kl_scores_collector_v2]
-        print(f"[DEBUG] Exported {len(_kl_scores_collector_v2)} batches KL to {save_path}")
-        print(f"[DEBUG] Shapes: {shapes}")
-        _kl_scores_collector_v2.clear()
+        _kl_scores_collector.clear()
+
+    # 导出 KL thresholds
+    if _kl_threshold_collector:
+        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export', f'epoch_{_current_epoch:03d}')
+        os.makedirs(export_dir, exist_ok=True)
+        save_path = os.path.join(export_dir, 'kl_thresholds.pkl')
+        with open(save_path, 'wb') as f:
+            pickle.dump(_kl_threshold_collector, f)
+        _kl_threshold_collector.clear()
 
 
-def compute_window_relative_entropy_v2(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
+def _export_inc_scores():
+    """导出收集的INC分数到文件"""
+    global _inc_scores_collector, _current_epoch, _inc_threshold_collector
+    if _inc_scores_collector:
+        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export', f'epoch_{_current_epoch:03d}')
+        os.makedirs(export_dir, exist_ok=True)
+        save_path = os.path.join(export_dir, 'inc_scores.pkl')
+
+        import pickle
+        with open(save_path, 'wb') as f:
+            pickle.dump(_inc_scores_collector, f)
+
+        _inc_scores_collector.clear()
+
+    # 导出 INC thresholds
+    if _inc_threshold_collector:
+        export_dir = os.path.join(os.path.dirname(__file__), 'kl_scores_export', f'epoch_{_current_epoch:03d}')
+        os.makedirs(export_dir, exist_ok=True)
+        save_path = os.path.join(export_dir, 'inc_thresholds.pkl')
+        with open(save_path, 'wb') as f:
+            pickle.dump(_inc_threshold_collector, f)
+        _inc_threshold_collector.clear()
+
+
+def set_epoch(epoch):
+    """供外部调用设置当前epoch"""
+    global _current_epoch
+    _current_epoch = epoch
+
+
+def register_enabled_collections(enabled_set):
+    """供外部调用注册需要收集的stage/block组合"""
+    global _enabled_collections
+    _enabled_collections = enabled_set
+
+
+def reset_collectors():
+    """重置计数器，在每个epoch开始时调用"""
+    global _kl_img_counter, _inc_img_counter, _kl_threshold_collector, _inc_threshold_collector
+    _kl_img_counter = 0
+    _inc_img_counter = 0
+    _kl_threshold_collector.clear()
+    _inc_threshold_collector.clear()
+
+
+def compute_window_relative_entropy(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
     """Compute KL divergence for each window
-
+    
     Args:
         x_windows: (total_windows, window_size, window_size, C)
         B: batch size
         window_size: window size
-
+    
     Returns:
         kl: (B * N_win,) KL score for each window
     """
     total_windows, _, _, C = x_windows.shape
     N_win = total_windows // B
-
+    
     x_windows = x_windows.view(B, N_win, window_size * window_size, C)
     local_dist = F.softmax(x_windows.mean(dim=2), dim=-1)
     global_dist = local_dist.mean(dim=1, keepdim=True)
-    kl = (local_dist * torch.log(local_dist / (global_dist + 1e-8))).sum(dim=-1)
-
+    # kl = (local_dist * torch.log(local_dist / (global_dist + 1e-8))).sum(dim=-1)
+    kl = (local_dist * torch.log((local_dist + 1e-8) / (global_dist + 1e-8))).sum(dim=-1)
+    
     return kl.view(-1)
 
 
@@ -100,7 +215,6 @@ class ThresholdPredictor(nn.Module):
         Returns:
             threshold: (B, 1) 预测的阈值τ
         """
-        # 构造6维输入
         B = stats_mean.shape[0]
         mlp_input = torch.cat([
             stats_mean, stats_std, stats_p50, stats_max,
@@ -121,12 +235,20 @@ def compute_soft_mask(scores: torch.Tensor, threshold: torch.Tensor, temperature
     Returns:
         m_mask: (N,) 软掩码，值在0~1之间
     """
-    # threshold: (B, 1) -> squeeze to (B,)
     threshold_expanded = threshold.squeeze(-1)  # (B,)
     B = threshold_expanded.shape[0]
     N = scores.shape[0] // B
     threshold_tiled = threshold_expanded.repeat(N)  # (B*N,)
-    return torch.sigmoid((scores - threshold_tiled) / temperature)
+    m_mask = torch.sigmoid((scores - threshold_tiled) / temperature)
+    
+    # 数值检查：确保不包含 NaN/Inf
+    if not torch.isfinite(m_mask).all():
+        m_mask = torch.where(torch.isfinite(m_mask), m_mask, torch.ones_like(m_mask) * 0.5)
+    
+    # 裁剪到有效范围
+    m_mask = torch.clamp(m_mask, min=1e-6, max=1 - 1e-6)
+    
+    return m_mask
 
 
 def collect_stats(scores: torch.Tensor, batch_size: int) -> tuple:
@@ -165,17 +287,187 @@ def compute_gate_loss(m_mask: torch.Tensor, scores: torch.Tensor, lambda_reg: fl
     N = scores.shape[0]
     reserved_sum = (m_mask * scores).sum()
     total_sum = scores.sum()
+    
+    # 数值保护：确保 total_sum 是有限的
+    if not torch.isfinite(total_sum):
+        total_sum = torch.tensor(1e-8, device=scores.device)
+    
     info_ratio = reserved_sum / (total_sum + 1e-8)
-
     activation_ratio = m_mask.sum() / N
-
+    
     loss = (1 - info_ratio) ** 2 + lambda_reg * activation_ratio
+    
+    # 确保 loss 是有限的
+    if not torch.isfinite(loss):
+        loss = torch.tensor(0.0, device=scores.device, requires_grad=True)
+    
     return loss
 
 
-class SwinBlockV2(nn.Module):
-    """Swin Block with optional KL pruning (Cross-Layer Design)"""
+class CrossStageInfo:
+    """跨stage传递的对齐信息"""
+    def __init__(self, aligned_windows, aligned_entropy, kl_scores, channel, hw_shape):
+        self.aligned_windows = aligned_windows
+        self.aligned_entropy = aligned_entropy
+        self.kl_scores = kl_scores
+        self.channel = channel
+        self.hw_shape = hw_shape
 
+
+def kl_weighted_pool_and_align(prev_windows: torch.Tensor, prev_kl_scores: torch.Tensor,
+                                prev_full_entropy: torch.Tensor,
+                                prev_channel: int, target_channel: int,
+                                target_hw_shape: tuple, target_window_size: int,
+                                prev_hw_shape: tuple, prev_window_size: int) -> tuple:
+    """跨stage特征对齐：恢复2D空间结构后做标准下采样，再重新窗口化
+
+    Args:
+        prev_windows: (B*N_prev, window_size, window_size, C_prev) 前一stage的窗口特征（完整窗口）
+        prev_kl_scores: (B*N_prev,) 前一stage的KL分数
+        prev_full_entropy: (B*N_prev,) 前一stage完整窗口的entropy（KL剪枝前计算）
+        prev_channel: int 前一stage的通道数
+        target_channel: int 目标通道数
+        target_hw_shape: tuple 目标分辨率 (H, W)
+        target_window_size: int 目标窗口大小
+        prev_hw_shape: tuple 前一stage的分辨率 (H, W)
+        prev_window_size: int 前一stage的窗口大小
+
+    Returns:
+        aligned_windows: 对齐后的窗口特征 (B*N_target, window_size, window_size, target_channel)
+        aligned_entropy: 对齐后的entropy (B*N_target,)
+    """
+    B = prev_kl_scores.shape[0] if prev_kl_scores.numel() > 0 else 1
+    if B == 0 or prev_full_entropy.numel() == 0:
+        B = prev_windows.shape[0] // (int(np.ceil(prev_hw_shape[0] / prev_window_size)) * int(np.ceil(prev_hw_shape[1] / prev_window_size)))
+
+    if B == 0:
+        B = 1
+
+    total_prev_windows = prev_windows.shape[0]
+    N_prev = total_prev_windows // B
+
+    H_prev = int(np.ceil(prev_hw_shape[0] / prev_window_size))
+    W_prev = int(np.ceil(prev_hw_shape[1] / prev_window_size))
+    C_prev = prev_windows.shape[3]
+
+    H_target, W_target = target_hw_shape
+
+    prev_windows_flat = prev_windows.view(B, N_prev, -1, C_prev)
+
+    kl_weights = F.softmax(prev_kl_scores.view(B, N_prev), dim=-1)
+
+    # Step 1: Restore 2D spatial structure
+    # prev_windows: (B*N_prev, ws, ws, C) → (B, H_prev, W_prev, ws, ws, C) → (B, H_prev*ws, W_prev*ws, C)
+    prev_windows_2d = prev_windows.view(B, H_prev, W_prev, prev_window_size, prev_window_size, C_prev)
+    prev_feat_2d = prev_windows_2d.permute(0, 5, 1, 3, 2, 4).contiguous()
+    prev_feat_2d = prev_feat_2d.view(B, C_prev, H_prev * prev_window_size, W_prev * prev_window_size)
+
+    # Step 2: Apply 2D downsampling with KL-weighted pooling
+    # For each 2x2 spatial neighborhood, compute KL-weighted average
+    scale_factor = 2
+    H_down = int(np.ceil(H_prev / scale_factor))
+    W_down = int(np.ceil(W_prev / scale_factor))
+
+    downsampled_windows_list = []
+    downsampled_entropy_list = []
+
+    for b in range(B):
+        feat_b = prev_feat_2d[b]  # (C_prev, H_prev*ws, W_prev*ws)
+        weights_b = kl_weights[b]  # (N_prev,)
+
+        down_windows_b = []
+        down_entropy_b = []
+
+        for h in range(H_down):
+            for w in range(W_down):
+                # 2x2 spatial neighborhood in 2D feature map
+                # Each window corresponds to (h*2, w*2), (h*2, w*2+1), (h*2+1, w*2), (h*2+1, w*2+1) in original
+                h_base = h * scale_factor
+                w_base = w * scale_factor
+
+                # Collect 2x2=4 windows' KL weights and features
+                indices = []
+                for dh in range(scale_factor):
+                    for dw in range(scale_factor):
+                        win_h = h_base + dh
+                        win_w = w_base + dw
+                        if win_h < H_prev and win_w < W_prev:
+                            idx = win_h * W_prev + win_w
+                            indices.append(idx)
+
+                if len(indices) == 0:
+                    down_windows_b.append(torch.zeros(target_window_size, target_window_size, C_prev, device=feat_b.device, dtype=feat_b.dtype))
+                    down_entropy_b.append(torch.zeros(1, device=feat_b.device))
+                    continue
+
+                # KL-weighted pooling of 2x2 windows
+                weights_2x2 = weights_b[indices]  # (num_neighbors,)
+                weights_2x2_norm = F.softmax(weights_2x2, dim=0)
+
+                # Aggregate features from 2x2 windows
+                feat_2x2 = []
+                for idx in indices:
+                    flat_idx = b * N_prev + idx
+                    win_feat = prev_windows[flat_idx]  # (ws, ws, C_prev)
+                    feat_2x2.append(win_feat)
+
+                feat_2x2 = torch.stack(feat_2x2, dim=0)  # (num_neighbors, ws, ws, C_prev)
+                weights_2x2_norm = weights_2x2_norm.view(-1, 1, 1, 1)
+
+                pooled_feat = (feat_2x2 * weights_2x2_norm).sum(dim=0)  # (ws, ws, C_prev)
+                down_windows_b.append(pooled_feat)
+
+                # KL-weighted pooling of entropy
+                entropy_2x2 = prev_full_entropy.view(B, N_prev)[b, indices]  # (num_neighbors,)
+                pooled_ent = (entropy_2x2 * F.softmax(weights_2x2, dim=0)).sum()
+                down_entropy_b.append(pooled_ent)
+
+        down_windows_b = torch.stack(down_windows_b, dim=0)  # (H_down*W_down, ws, ws, C_prev)
+        down_entropy_b = torch.stack(down_entropy_b, dim=0)  # (H_down*W_down,)
+
+        downsampled_windows_list.append(down_windows_b)
+        downsampled_entropy_list.append(down_entropy_b)
+
+    aligned_windows = torch.cat(downsampled_windows_list, dim=0)  # (B*N_target, ws, ws, C_prev)
+    aligned_entropy = torch.cat(downsampled_entropy_list, dim=0)  # (B*N_target,)
+
+    # Step 3: Channel alignment if needed
+    if prev_channel != target_channel:
+        aligned_windows_flat = aligned_windows.view(B * H_down * W_down, target_window_size * target_window_size, prev_channel)
+        aligned_windows_flat = aligned_windows_flat.permute(0, 2, 1)
+
+        conv = nn.Conv1d(prev_channel, target_channel, kernel_size=1).to(aligned_windows.device)
+        aligned_windows_flat = conv(aligned_windows_flat)
+        aligned_windows_flat = aligned_windows_flat.permute(0, 2, 1)
+
+        aligned_windows = aligned_windows_flat.view(B * H_down * W_down, target_window_size, target_window_size, target_channel)
+
+    return aligned_windows, aligned_entropy
+
+
+def compute_aligned_entropy_from_windows(x_windows: torch.Tensor, B: int, window_size: int = 7) -> torch.Tensor:
+    """从对齐后的窗口特征计算entropy
+    
+    Args:
+        x_windows: (B*N, window_size, window_size, C)
+        B: batch size
+        window_size: window size
+    
+    Returns:
+        entropy: (B*N,) entropy for each window
+    """
+    total_windows = x_windows.shape[0]
+    N_win = total_windows // B
+    x_flat = x_windows.view(B, N_win, window_size * window_size, -1)
+    x_flat = x_flat.view(-1, window_size * window_size, x_windows.shape[-1])
+    attn = F.softmax(x_flat, dim=-1)
+    entropy = -torch.sum(attn * torch.log(attn + 1e-8), dim=-1).mean(dim=1)
+    return entropy.view(B, N_win).view(-1)
+
+
+class SwinBlockV3(nn.Module):
+    """Swin Block with optional KL pruning (Cross-Layer Design)"""
+    
     def __init__(
         self,
         embed_dims: int,
@@ -204,7 +496,7 @@ class SwinBlockV2(nn.Module):
         lambda_inc: float = 0.1,
     ):
         super().__init__()
-
+        
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.window_size = window_size
@@ -221,10 +513,12 @@ class SwinBlockV2(nn.Module):
         self.temperature = temperature
         self.lambda_kl = lambda_kl
         self.lambda_inc = lambda_inc
-
+        self.kl_gate_loss = None
+        self.inc_gate_loss = None
+        
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
-
+        
         self.attn = ShiftWindowMSA(
             embed_dims=embed_dims,
             num_heads=num_heads,
@@ -236,7 +530,7 @@ class SwinBlockV2(nn.Module):
             proj_drop_rate=drop_rate,
             dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
             init_cfg=None)
-
+        
         from mmcv.cnn.bricks.transformer import FFN
         self.ffn = FFN(
             embed_dims=embed_dims,
@@ -247,386 +541,366 @@ class SwinBlockV2(nn.Module):
             act_cfg=act_cfg,
             add_identity=True,
             init_cfg=None)
-
-    def forward(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None, kl_cache: torch.Tensor = None, prev_windows: torch.Tensor = None, prev_hw_shape: tuple = None, prev_window_size: int = None) -> tuple:
+    
+    def forward(self, x: torch.Tensor, hw_shape: tuple, 
+                entropy_cache: torch.Tensor = None, 
+                prev_aligned_entropy: torch.Tensor = None,
+                prev_kl_keep_idx: torch.Tensor = None) -> tuple:
         """Forward function
-
+        
         Args:
             x: input features
             hw_shape: spatial shape (H, W)
-            entropy_cache: entropy from previous layer for INC comparison
-            kl_cache: KL scores from previous stage for cross-stage alignment
-            prev_windows: window features from previous stage for cross-stage alignment
-            prev_hw_shape: spatial shape of previous stage output
-
+            entropy_cache: entropy from previous W-MSA in same stage for INC comparison
+            prev_aligned_entropy: entropy from previous stage for cross-stage INC comparison
+            prev_kl_keep_idx: KL keep indices from previous stage
+        
         Returns:
             x: output features
-            entropy_or_tuple: entropy value, or tuple (entropy, kl_scores, windows_out)
+            entropy_or_tuple: entropy value, or tuple with additional info for cross-stage
         """
         can_prune_kl = self.kl_ratio is not None and self.kl_ratio < 1.0
         can_prune_inc = self.inc_ratio is not None and self.inc_ratio < 1.0
-
+        
         if self.shift_size > 0:
-            result = self._forward_base(x, hw_shape)
-            return result[0], None, None
-
+            return self._forward_base(x, hw_shape), None, None, None, None, None, None, None, None
+        
         if not can_prune_kl and not can_prune_inc:
-            result = self._forward_base(x, hw_shape)
-            return result[0], None, None
-
+            return self._forward_base(x, hw_shape), None, None, None, None, None, None, None, None
+        
         if self.strategy is not None:
             if self.strategy == 'kl_inc' and can_prune_kl and can_prune_inc:
-                result = self._forward_kl_inc(x, hw_shape, entropy_cache, kl_cache, prev_windows, prev_hw_shape, prev_window_size)
-                return result[0], result[1], None
+                return self._forward_kl_inc(x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx)
             elif self.strategy in ['kl', 'kl_inc'] and can_prune_kl:
-                result = self._forward_kl(x, hw_shape, kl_cache)
-                return result[0], result[1], None
+                return self._forward_kl(x, hw_shape)
             elif self.strategy in ['inc', 'kl_inc'] and can_prune_inc:
-                result = self._forward_inc(x, hw_shape, entropy_cache)
-                return result[0], result[1], None
-
-        result = self._forward_base(x, hw_shape)
-        return result[0], None, None
-
+                return self._forward_inc(x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx)
+        
+        return self._forward_base(x, hw_shape), None, None, None, None, None, None, None, None
+    
     def _forward_base(self, x: torch.Tensor, hw_shape: tuple) -> torch.Tensor:
         """Base forward without pruning"""
         B, L, C = x.shape
         H, W = hw_shape
-
+        
         identity = x
         x = self.norm1(x)
         x = self.attn(x, hw_shape)
         x = x + identity
-
+        
         identity = x
         x = self.norm2(x)
         x = self.ffn(x, identity=identity)
-
-        return x, None, None
-
-    def _forward_kl(self, x: torch.Tensor, hw_shape: tuple, kl_cache: torch.Tensor = None) -> tuple:
-        """KL pruning forward
-
-        Args:
-            x: input features
-            hw_shape: spatial shape (H, W)
-            kl_cache: KL scores from previous stage for cross-stage alignment
-
-        Returns:
-            x: output features
-            (full_entropy, window_scores): tuple of entropy and KL scores for all windows
-        """
+        
+        return x
+    
+    def _forward_kl(self, x: torch.Tensor, hw_shape: tuple) -> tuple:
+        """KL pruning forward"""
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, f'Input size mismatch: {L} vs {H}*{W}'
-
+        
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-
+        
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
-
+        
         if self.shift_size > 0 or self.kl_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
-            return base_result[0], None, None
-
-        window_scores = compute_window_relative_entropy_v2(x_windows, B, self.window_size)
+            return base_result, None, None, None, None, None, None, None
+        
+        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
         window_scores = window_scores.view(B, -1)
-        _collect_kl_scores_v2(window_scores)
+        _collect_kl_scores(window_scores, self.stage_idx, self.block_idx)
 
         k = max(1, int(N_win * self.kl_ratio))
         _, keep_idx = torch.topk(window_scores, k=k, dim=1)
         keep_idx = keep_idx.sort(dim=1)[0]
-
+        
         batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
         keep_idx_flat = (keep_idx + batch_offsets).view(-1)
-
+        
         x_to_attn = x_windows[keep_idx_flat]
         x_to_attn = x_to_attn.view(-1, self.window_size * self.window_size, C)
-
+        
         identity_attn = x_to_attn
         x_after_attn = self.norm1(x_to_attn)
         x_after_attn = self.attn.w_msa(x_after_attn)
         x_after_attn = identity_attn + x_after_attn
-
+        
         cur_entropy_local = self._compute_entropy(x_after_attn)
         full_entropy = torch.zeros(total_windows, device=x.device)
         full_entropy[keep_idx_flat] = cur_entropy_local.detach()
-
+        
         identity_ffn = x_after_attn
         x_after_ffn = self.norm2(x_after_attn)
         x_after_ffn = self.ffn(x_after_ffn)
         x_after_ffn = identity_ffn + x_after_ffn
-
+        
         x_windows_new = x_windows.clone()
         x_ffn_reshaped = x_after_ffn.view(-1, self.window_size, self.window_size, C)
         x_windows_new[keep_idx_flat] = x_ffn_reshaped
-
+        
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-
+        
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-
+        
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
-
-        # Return both entropy and KL scores for cross-stage alignment
+        
         block_gate_loss = None
         if self.use_learnable_gate and self.kl_predictor is not None:
-            # 收集统计量并预测阈值
             scores_flat = window_scores.view(-1)
             stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
             threshold = self.kl_predictor(stats_mean, stats_std, stats_p50, stats_max,
-                                         self.stage_idx, self.block_idx)
+                                          self.stage_idx, self.block_idx)
             m_mask = compute_soft_mask(scores_flat, threshold, self.temperature)
             kl_loss = compute_gate_loss(m_mask, scores_flat, self.lambda_kl)
             self.kl_gate_loss = kl_loss
+            # threshold shape is (B, 1), collect for each batch element
+            for b in range(B):
+                collect_threshold(threshold[b].item(), self.stage_idx, self.block_idx, 'kl')
             block_gate_loss = (kl_loss, None)
+        
+        # 数值检查：确保输出不包含 NaN/Inf
+        if not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return x, full_entropy, x_windows, x_windows, window_scores, (H_pad, W_pad), self.embed_dims, keep_idx_flat, block_gate_loss
 
-        return x, (full_entropy, window_scores, x_windows), block_gate_loss
-
-    def _forward_inc(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None) -> tuple:
-        """Incremental pruning forward with cross-layer comparison"""
+    def _forward_inc(self, x: torch.Tensor, hw_shape: tuple, 
+                  entropy_cache: torch.Tensor = None, 
+                  prev_aligned_entropy: torch.Tensor = None,
+                  prev_kl_keep_idx: torch.Tensor = None) -> tuple:
+        """Incremental pruning forward with cross-layer and cross-stage comparison
+        
+        Args:
+            entropy_cache: entropy from previous W-MSA in same stage
+            prev_aligned_entropy: entropy from previous stage (aligned)
+        """
         B, L, C = x.shape
         H, W = hw_shape
         assert L == H * W, f'Input size mismatch: {L} vs {H}*{W}'
-
+        
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-
+        
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
-
+        
         if self.shift_size > 0 or self.inc_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
-            return base_result[0], None, None
-
+            return base_result, None, None, None, None, None, None, None
+        
         x_windows_flat = x_windows.view(-1, self.window_size * self.window_size, C)
         identity_attn = x_windows_flat
         x_after_attn = self.norm1(x_windows_flat)
         x_after_attn = self.attn.w_msa(x_after_attn)
         x_after_attn = identity_attn + x_after_attn
-
+        
         cur_entropy = self._compute_entropy(x_after_attn)
+        
+        inc_scores = torch.zeros_like(cur_entropy)
 
-        if entropy_cache is None or entropy_cache.shape[0] != total_windows:
-            inc_scores = torch.zeros_like(cur_entropy)
-        else:
+        if entropy_cache is not None and entropy_cache.shape[0] == total_windows:
+            # Intra-stage comparison (same stage, no downsampling needed)
             inc_scores = torch.abs(cur_entropy - entropy_cache.detach())
+        elif prev_aligned_entropy is not None and prev_aligned_entropy.shape[0] == total_windows:
+            # Cross-stage comparison (different stage, needs downsampling)
+            # After fixing issues 1 & 2, window counts should match exactly
+            cross_stage_scores = torch.abs(cur_entropy - prev_aligned_entropy.detach())
+            inc_scores = cross_stage_scores
+        
         inc_scores = inc_scores.view(B, -1)
+        _collect_inc_scores(inc_scores, self.stage_idx, self.block_idx)
 
         k = max(1, int(N_win * self.inc_ratio))
         _, inc_keep_idx = torch.topk(inc_scores, k=k, dim=1)
         inc_keep_idx = inc_keep_idx.sort(dim=1)[0]
-
+        
         batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
         inc_keep_idx_flat = (inc_keep_idx + batch_offsets).view(-1)
-
+        
         x_ffn_input = x_after_attn[inc_keep_idx_flat]
         identity_ffn = x_ffn_input
         x_ffn_input = self.norm2(x_ffn_input)
         x_ffn_input = self.ffn(x_ffn_input)
         x_ffn_input = identity_ffn + x_ffn_input
-
+        
         x_windows_new = x_windows.clone()
         x_windows_new_reshaped = x_ffn_input.view(-1, self.window_size, self.window_size, C)
         x_windows_new[inc_keep_idx_flat] = x_windows_new_reshaped
-
+        
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-
+        
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
+        
+        block_gate_loss = None
+        if self.use_learnable_gate and self.inc_predictor is not None:
+            inc_scores_flat = inc_scores.view(-1)
+            stats_mean, stats_std, stats_p50, stats_max = collect_stats(inc_scores_flat, B)
+            threshold = self.inc_predictor(stats_mean, stats_std, stats_p50, stats_max,
+                                          self.stage_idx, self.block_idx)
+            m_mask = compute_soft_mask(inc_scores_flat, threshold, self.temperature)
+            inc_loss = compute_gate_loss(m_mask, inc_scores_flat, self.lambda_inc)
+            self.inc_gate_loss = inc_loss
+            for b in range(B):
+                collect_threshold(threshold[b].item(), self.stage_idx, self.block_idx, 'inc')
+            block_gate_loss = (None, inc_loss)
+        
+        # 数值检查：确保输出不包含 NaN/Inf
+        if not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return x, cur_entropy.detach(), x_windows, None, hw_shape, self.embed_dims, block_gate_loss
 
-        return x, cur_entropy.detach(), None
-
-    def _forward_kl_inc(self, x: torch.Tensor, hw_shape: tuple, entropy_cache: torch.Tensor = None, kl_cache: torch.Tensor = None, prev_windows: torch.Tensor = None, prev_hw_shape: tuple = None, prev_window_size: int = None) -> tuple:
-        """KL + INC 串联筛选 with cross-layer comparison
-
-        核心逻辑：
-        1. KL计算每个窗口的特征分布差异，筛选一部分窗口
-        2. INC：当前窗口与上一Stage对应位置窗口的特征做比较
-        3. 跨Stage时：上一Stage特征经KL加权池化后，再与当前Stage比较
-
-        Args:
-            x: input features
-            hw_shape: spatial shape (H, W)
-            entropy_cache: entropy from previous layer for INC comparison
-            kl_cache: KL scores from previous stage for cross-stage alignment
-            prev_windows: window features from previous stage for cross-stage alignment
-            prev_hw_shape: spatial shape of previous stage output
-            prev_window_size: window size of previous stage
-
-        Returns:
-            x: output features
-            (full_entropy, window_scores, windows_out): tuple of entropy, KL scores, and window features
-        """
+    def _forward_kl_inc(self, x: torch.Tensor, hw_shape: tuple, 
+                     entropy_cache: torch.Tensor = None,
+                     prev_aligned_entropy: torch.Tensor = None,
+                     prev_kl_keep_idx: torch.Tensor = None) -> tuple:
+        """KL + INC 串联筛选 with cross-layer and cross-stage comparison"""
         if self.inc_ratio is None:
-            result = self._forward_kl(x, hw_shape, kl_cache)
-            return result[0], result[1], None
-
+            return self._forward_kl(x, hw_shape)
+        
         B, L, C = x.shape
         H, W = hw_shape
         x = x.view(B, H, W, C)
-
+        
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         H_pad, W_pad = x.shape[1], x.shape[2]
-
+        
         shifted_x = x if self.shift_size == 0 else torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         x_windows = self._window_partition(shifted_x)
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
-
+        batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
+        
         if self.shift_size > 0 or self.kl_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
-            return base_result[0], None, None
-
-        window_scores = compute_window_relative_entropy_v2(x_windows, B, self.window_size)
+            return base_result, None, None, None, None, None, None, None
+        
+        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
         window_scores = window_scores.view(B, -1)
-        _collect_kl_scores_v2(window_scores)
+        _collect_kl_scores(window_scores, self.stage_idx, self.block_idx)
 
-        # ========== 跨Stage INC比较 ==========
-        # 如果有上一Stage传来的特征，对其进行KL加权池化后与当前特征比较
-        cur_entropy = None
-        if prev_windows is not None and entropy_cache is not None:
-            # prev_windows: 上一Stage的窗口特征 (B, N_win_prev, window_size^2, C)
-            # entropy_cache: 上一Stage的entropy (B * N_win_prev,)
-            # kl_cache: 上一Stage的KL分数 (B, N_win_prev)
-
-            # 对上一Stage特征做KL加权池化，对齐到当前Stage尺度
-            aligned_prev_windows = SwinTransformerV2._align_cross_stage_features(
-                prev_windows, kl_cache, prev_hw_shape, prev_windows.shape[1]
-            )  # (B, N_win, window_size^2, C)
-
-            # 对池化后的特征计算entropy
-            aligned_prev_entropy = self._compute_entropy(
-                aligned_prev_windows.view(-1, self.window_size * self.window_size, C)
-            )  # (B * N_win,)
-
-            # 当前Stage KL筛选后的特征计算entropy
-            k_kl = max(1, int(N_win * self.kl_ratio))
-            _, kl_keep_idx = torch.topk(window_scores, k=k_kl, dim=1)
-            kl_keep_idx = kl_keep_idx.sort(dim=1)[0]
-            batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
-            kl_keep_idx_flat = (kl_keep_idx + batch_offsets).view(-1)
-
-            x_kl = x_windows[kl_keep_idx_flat]
-            x_kl = x_kl.view(-1, self.window_size * self.window_size, C)
-            identity_attn = x_kl
-            x_kl = self.norm1(x_kl)
-            x_kl = self.attn.w_msa(x_kl)
-            x_kl = identity_attn + x_kl
-
-            cur_entropy = self._compute_entropy(x_kl)  # (B * k_kl,)
-
-            # INC分数：当前entropy vs 上一Stage对齐后的entropy
-            # 空间位置一一对应
-            inc_scores = torch.abs(cur_entropy - aligned_prev_entropy.detach())
-
-            k_inc = max(1, int(k_kl * self.inc_ratio))
-            _, inc_keep_idx = torch.topk(inc_scores, k=k_inc, dim=1)
-            inc_keep_idx = inc_keep_idx.sort(dim=1)[0]
-
-            kl_batch_offsets = (torch.arange(B, device=x.device) * k_kl).unsqueeze(1)
-            inc_keep_idx_flat = (inc_keep_idx + kl_batch_offsets).view(-1)
-
-            # FFN处理
-            x_ffn_input = x_kl[inc_keep_idx_flat]
-            identity_ffn = x_ffn_input
-            x_ffn_input = self.norm2(x_ffn_input)
-            x_ffn_input = self.ffn(x_ffn_input)
-            x_ffn_input = identity_ffn + x_ffn_input
-
-            # 重建完整特征图
-            x_windows_new = x_windows.clone()
-            x_kl_reshaped = x_kl.view(-1, self.window_size, self.window_size, C)
-            x_windows_new[kl_keep_idx_flat] = x_kl_reshaped
-            x_ffn_reshaped = x_ffn_input.view(-1, self.window_size, self.window_size, C)
-            x_windows_new[kl_keep_idx_flat[inc_keep_idx_flat]] = x_ffn_reshaped
-
-            attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
-            shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
-            x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-            if pad_r > 0 or pad_b > 0:
-                x = x[:, :H, :W, :].contiguous()
-            x = x.view(B, H * W, C)
-
-            # 返回值：当前Stage所有窗口的entropy + KL分数 + 特征图 + 填充尺寸 + window_size
-            full_entropy = torch.zeros(total_windows, device=x.device)
-            full_entropy[kl_keep_idx_flat] = cur_entropy.detach()
-            windows_out = x_windows  # 返回原始窗口特征用于下一Stage
-
-            return x, (full_entropy, window_scores, windows_out, (H_pad, W_pad), self.window_size), None
-
-        # ========== 同Stage内INC比较（无跨Stage特征）==========
         k_kl = max(1, int(N_win * self.kl_ratio))
         _, kl_keep_idx = torch.topk(window_scores, k=k_kl, dim=1)
         kl_keep_idx = kl_keep_idx.sort(dim=1)[0]
-        batch_offsets = (torch.arange(B, device=x.device) * N_win).unsqueeze(1)
+        
         kl_keep_idx_flat = (kl_keep_idx + batch_offsets).view(-1)
-
+        
+        x_windows_flat = x_windows.view(-1, self.window_size * self.window_size, C)
+        full_entropy_before_kl = self._compute_entropy(x_windows_flat)
+        
         x_kl = x_windows[kl_keep_idx_flat]
         x_kl = x_kl.view(-1, self.window_size * self.window_size, C)
         identity_attn = x_kl
         x_kl = self.norm1(x_kl)
         x_kl = self.attn.w_msa(x_kl)
         x_kl = identity_attn + x_kl
-
+        
         cur_entropy = self._compute_entropy(x_kl)
+        
+        inc_scores = torch.zeros_like(cur_entropy)
 
-        # 同Stage内：与上一block的entropy比较
-        if entropy_cache is None or entropy_cache.shape[0] != total_windows:
-            inc_scores = torch.zeros_like(cur_entropy)
-        else:
+        if entropy_cache is not None and entropy_cache.shape[0] == total_windows:
+            # Intra-stage comparison (same stage, no downsampling needed)
             inc_scores = torch.abs(cur_entropy - entropy_cache[kl_keep_idx_flat].detach())
+        elif prev_aligned_entropy is not None and prev_aligned_entropy.shape[0] == total_windows:
+            # Cross-stage comparison (different stage, needs downsampling)
+            # After fixing issues 1 & 2, window counts should match exactly
+            cross_stage_scores = torch.abs(cur_entropy - prev_aligned_entropy[kl_keep_idx_flat].detach())
+            inc_scores = cross_stage_scores
+        
         inc_scores = inc_scores.view(B, -1)
+        _collect_inc_scores(inc_scores, self.stage_idx, self.block_idx)
 
         k_inc = max(1, int(k_kl * self.inc_ratio))
         _, inc_keep_idx = torch.topk(inc_scores, k=k_inc, dim=1)
         inc_keep_idx = inc_keep_idx.sort(dim=1)[0]
-
+        
         kl_batch_offsets = (torch.arange(B, device=x.device) * k_kl).unsqueeze(1)
         inc_keep_idx_flat = (inc_keep_idx + kl_batch_offsets).view(-1)
-
+        
         x_ffn_input = x_kl[inc_keep_idx_flat]
         identity_ffn = x_ffn_input
         x_ffn_input = self.norm2(x_ffn_input)
         x_ffn_input = self.ffn(x_ffn_input)
         x_ffn_input = identity_ffn + x_ffn_input
-
+        
         x_windows_new = x_windows.clone()
         x_kl_reshaped = x_kl.view(-1, self.window_size, self.window_size, C)
         x_windows_new[kl_keep_idx_flat] = x_kl_reshaped
+        
         x_ffn_reshaped = x_ffn_input.view(-1, self.window_size, self.window_size, C)
         x_windows_new[kl_keep_idx_flat[inc_keep_idx_flat]] = x_ffn_reshaped
-
+        
         attn_windows = x_windows_new.view(-1, self.window_size, self.window_size, C)
         shifted_x = self._window_reverse(attn_windows, H_pad, W_pad)
+        
         x = shifted_x if self.shift_size == 0 else torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
+        
+        full_entropy = full_entropy_before_kl
+        
+        block_gate_loss = None
+        if self.use_learnable_gate:
+            # KL 门控
+            if self.kl_predictor is not None:
+                kl_scores_flat = window_scores.view(-1)
+                stats_mean, stats_std, stats_p50, stats_max = collect_stats(kl_scores_flat, B)
+                threshold = self.kl_predictor(stats_mean, stats_std, stats_p50, stats_max,
+                                              self.stage_idx, self.block_idx)
+                m_mask = compute_soft_mask(kl_scores_flat, threshold, self.temperature)
+                kl_loss = compute_gate_loss(m_mask, kl_scores_flat, self.lambda_kl)
+                self.kl_gate_loss = kl_loss
+                for b in range(B):
+                    collect_threshold(threshold[b].item(), self.stage_idx, self.block_idx, 'kl')
+            else:
+                kl_loss = None
 
-        full_entropy = torch.zeros(total_windows, device=x.device)
-        full_entropy[kl_keep_idx_flat] = cur_entropy.detach()
-        windows_out = x_windows
-
-        return x, (full_entropy, window_scores, windows_out, (H_pad, W_pad), self.window_size), None
+            # INC 门控
+            if self.inc_predictor is not None and inc_scores.numel() > 0:
+                inc_scores_flat = inc_scores.view(-1)
+                stats_mean, stats_std, stats_p50, stats_max = collect_stats(inc_scores_flat, B)
+                threshold = self.inc_predictor(stats_mean, stats_std, stats_p50, stats_max,
+                                              self.stage_idx, self.block_idx)
+                m_mask = compute_soft_mask(inc_scores_flat, threshold, self.temperature)
+                inc_loss = compute_gate_loss(m_mask, inc_scores_flat, self.lambda_inc)
+                self.inc_gate_loss = inc_loss
+                for b in range(B):
+                    collect_threshold(threshold[b].item(), self.stage_idx, self.block_idx, 'inc')
+            else:
+                inc_loss = None
+            
+            block_gate_loss = (kl_loss, inc_loss)
+        
+        # 数值检查：确保输出不包含 NaN/Inf
+        if not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return x, full_entropy, x_windows, x_windows, window_scores, (H_pad, W_pad), self.embed_dims, kl_keep_idx_flat, block_gate_loss
 
     def _window_partition(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, C = x.shape
@@ -662,7 +936,7 @@ class SwinBlockV2(nn.Module):
         if pad_r > 0 or pad_b > 0:
             x = x[:, :H, :W, :].contiguous()
         x = x.view(B, H * W, C)
-        return x, None, None
+        return x
 
     def _compute_entropy(self, x: torch.Tensor) -> torch.Tensor:
         """Compute entropy from attention features"""
@@ -672,9 +946,9 @@ class SwinBlockV2(nn.Module):
         return entropy
 
 
-class SwinBlockSequenceV2(nn.Module):
+class SwinBlockSequenceV3(nn.Module):
     """Swin Block Sequence with KL config
-
+    
     Args:
         embed_dims: feature dimension
         num_heads: number of attention heads
@@ -692,7 +966,7 @@ class SwinBlockSequenceV2(nn.Module):
         with_cp: use checkpoint
         block_kl_ratios: list of KL ratios for each block
     """
-
+    
     def __init__(
         self,
         embed_dims: int,
@@ -721,23 +995,23 @@ class SwinBlockSequenceV2(nn.Module):
         lambda_inc: float = 0.1,
     ):
         super().__init__()
-
+        
         if block_kl_ratios is None:
             block_kl_ratios = [None] * depth
         elif isinstance(block_kl_ratios, (int, float)):
             block_kl_ratios = [block_kl_ratios] * depth
-
+        
         if block_inc_ratios is None:
             block_inc_ratios = [None] * depth
         elif isinstance(block_inc_ratios, (int, float)):
             block_inc_ratios = [block_inc_ratios] * depth
-
+        
         self.blocks = nn.ModuleList()
         for i in range(depth):
             kl_ratio = block_kl_ratios[i] if i < len(block_kl_ratios) else None
             inc_ratio = block_inc_ratios[i] if i < len(block_inc_ratios) else None
-
-            block = SwinBlockV2(
+            
+            block = SwinBlockV3(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -764,102 +1038,142 @@ class SwinBlockSequenceV2(nn.Module):
                 lambda_inc=lambda_inc,
             )
             self.blocks.append(block)
-
+        
         self.downsample = downsample
-
-    def forward(self, x: torch.Tensor, hw_shape: tuple, kl_cache: torch.Tensor = None, entropy_cache: torch.Tensor = None, prev_windows: torch.Tensor = None, prev_hw_shape: tuple = None, prev_window_size: int = None):
-        """Forward function
-
+    
+    def forward(self, x: torch.Tensor, hw_shape: tuple, 
+                prev_cross_stage_info: dict = None,
+                next_stage_info: dict = None):
+        """Forward function with cross-stage INC comparison support
+        
         Args:
             x: (B, L, C) input features
             hw_shape: (H, W) spatial shape
-            kl_cache: KL scores from previous stage
-            entropy_cache: entropy from previous stage for cross-stage INC comparison
-            prev_windows: window features from previous stage for cross-stage alignment
-            prev_hw_shape: spatial shape of previous stage output
-
+            prev_cross_stage_info: dict with keys:
+                - 'prev_aligned_entropy': entropy from previous stage
+                - 'prev_windows': window features from previous stage  
+                - 'prev_kl_scores': KL scores from previous stage
+                - 'prev_channel': channel from previous stage
+            next_stage_info: dict for next stage (used for cross-stage alignment in this stage):
+                - 'channel': next stage channel
+                - 'hw_shape': next stage input spatial shape
+                - 'window_size': next stage window size
+        
         Returns:
             x_down: output features after downsample
             down_hw_shape: new spatial shape
             x: output features before downsample
             hw_shape: original spatial shape
-            kl_cache: KL scores from this stage
-            entropy_cache: entropy from this stage
-            prev_windows: window features from this stage
+            cross_stage_info: dict for next stage (aligned entropy, windows, kl_scores, channel, hw_shape)
         """
-        prev_entropy = entropy_cache
-        prev_kl = kl_cache
-        prev_win = prev_windows
-        total_kl_gate_loss = 0.0
-        total_inc_gate_loss = 0.0
-
-        last_windows_out = None
-        last_pad_hw = None
-        last_window_size = None
+        entropy_cache = None
+        prev_entropy = None
+        
+        prev_aligned_entropy = None
+        prev_kl_keep_idx = None
+        if prev_cross_stage_info is not None:
+            prev_aligned_entropy = prev_cross_stage_info.get('prev_aligned_entropy', None)
+            prev_kl_keep_idx = prev_cross_stage_info.get('prev_kl_keep_idx', None)
+        
+        last_wmsa_info = None
+        
         for i, block in enumerate(self.blocks):
-            result = block(x, hw_shape, prev_entropy, prev_kl, prev_win, prev_hw_shape, prev_window_size)
-            if isinstance(result, tuple):
-                x, entropy_or_tuple, block_gate_loss = result
-                if isinstance(entropy_or_tuple, tuple):
-                    tlen = len(entropy_or_tuple)
-                    if tlen == 5:
-                        new_entropy, kl_scores, windows_out, pad_hw, win_size = entropy_or_tuple
-                        last_pad_hw = pad_hw
-                        last_window_size = win_size
-                    elif tlen == 4:
-                        new_entropy, kl_scores, windows_out, pad_hw = entropy_or_tuple
-                        if pad_hw is not None:
-                            last_pad_hw = pad_hw
-                    else:
-                        new_entropy, kl_scores, windows_out = entropy_or_tuple
-                else:
-                    new_entropy = entropy_or_tuple
-                    kl_scores = None
-                    windows_out = None
-
+            result = block(x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx)
+            
+            if isinstance(result, tuple) and len(result) >= 8:
+                x = result[0]
+                new_entropy = result[1]
+                windows = result[2]
+                kl_scores = result[4]  # window_scores 在索引4位置
+                block_hw_shape = result[5]
+                channel = result[6]
+                kl_keep_idx = result[7] if len(result) > 7 else None
+                
+                block_gate_loss = result[8] if len(result) > 8 else None
                 if block_gate_loss is not None:
-                    if isinstance(block_gate_loss, tuple):
-                        kl_loss, inc_loss = block_gate_loss
-                        if kl_loss is not None:
-                            total_kl_gate_loss = total_kl_gate_loss + kl_loss
-                        if inc_loss is not None:
-                            total_inc_gate_loss = total_inc_gate_loss + inc_loss
-                    else:
-                        total_kl_gate_loss = total_kl_gate_loss + block_gate_loss
-
-                if block.shift_size == 0 and new_entropy is not None:
+                    if not hasattr(self, 'gate_losses'):
+                        self.gate_losses = []
+                    self.gate_losses.append(block_gate_loss)
+                
+                if block.shift_size == 0:
                     prev_entropy = new_entropy
-                    if kl_scores is not None:
-                        prev_kl = kl_scores
-                    if windows_out is not None:
-                        last_windows_out = windows_out
-
-        if last_windows_out is not None:
-            prev_win = last_windows_out
-
+                    entropy_cache = prev_entropy
+                    prev_kl_keep_idx = kl_keep_idx
+                    
+                    if windows is not None and kl_scores is not None:
+                        last_wmsa_info = {
+                            'windows': windows,
+                            'kl_scores': kl_scores,
+                            'kl_keep_idx': kl_keep_idx,
+                            'hw_shape': block_hw_shape,
+                            'channel': channel,
+                            'entropy': new_entropy,
+                            'window_size': block.window_size
+                        }
+            else:
+                x = result[0] if isinstance(result, tuple) else result
+                prev_aligned_entropy = None
+                prev_kl_keep_idx = None
+        
+        cross_stage_info = None
+        if last_wmsa_info is not None:
+            base_cross_stage_info = {
+                'prev_aligned_entropy': last_wmsa_info['entropy'],
+                'prev_windows': last_wmsa_info['windows'],
+                'prev_kl_scores': last_wmsa_info['kl_scores'],
+                'prev_kl_keep_idx': last_wmsa_info['kl_keep_idx'],
+                'prev_channel': last_wmsa_info['channel'],
+                'prev_hw_shape': last_wmsa_info['hw_shape'],
+                'window_size': self.blocks[0].window_size
+            }
+            
+            if next_stage_info is not None:
+                aligned_windows, aligned_entropy = kl_weighted_pool_and_align(
+                    prev_windows=last_wmsa_info['windows'],
+                    prev_kl_scores=last_wmsa_info['kl_scores'],
+                    prev_full_entropy=last_wmsa_info['entropy'],
+                    prev_channel=last_wmsa_info['channel'],
+                    target_channel=next_stage_info['channel'],
+                    target_hw_shape=next_stage_info['hw_shape'],
+                    target_window_size=next_stage_info['window_size'],
+                    prev_hw_shape=last_wmsa_info['hw_shape'],
+                    prev_window_size=last_wmsa_info.get('window_size', 7)
+                )
+                cross_stage_info = {
+                    'prev_aligned_entropy': aligned_entropy,
+                    'prev_windows': aligned_windows,
+                    'prev_kl_scores': last_wmsa_info['kl_scores'],
+                    'prev_kl_keep_idx': last_wmsa_info['kl_keep_idx'],
+                    'prev_channel': next_stage_info['channel'],
+                    'prev_hw_shape': next_stage_info['hw_shape'],
+                    'window_size': next_stage_info['window_size']
+                }
+            else:
+                cross_stage_info = base_cross_stage_info
+        
         if self.downsample is not None:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
-            return x_down, down_hw_shape, x, hw_shape, prev_kl, prev_entropy, prev_win, total_kl_gate_loss, total_inc_gate_loss, last_pad_hw, last_window_size
+            return x_down, down_hw_shape, x, hw_shape, cross_stage_info
         else:
-            return x, hw_shape, x, hw_shape, prev_kl, prev_entropy, prev_win, total_kl_gate_loss, total_inc_gate_loss, last_pad_hw, last_window_size
+            return x, hw_shape, x, hw_shape, cross_stage_info
 
 
 @MODELS.register_module()
-class SwinTransformerV2(SwinTransformer):
-    """Swin Transformer V2 with optional KL pruning
-
+class SwinTransformerV3(SwinTransformer):
+    """Swin Transformer V3 with optional KL pruning
+    
     Simplified implementation with two strategies:
     - 'base': No pruning, same as original Swin
     - 'kl': KL-based window pruning
-
+    
     Config:
         backbone=dict(
-            type='SwinTransformerV2',
+            type='SwinTransformerV3',
             embed_dims=96,
             depths=[2, 2, 6, 2],
             num_heads=[3, 6, 12, 24],
             window_size=7,
-
+            
             # Strategy configuration
             strategy='kl',    # 'base' or 'kl'
             stage_config={
@@ -869,7 +1183,7 @@ class SwinTransformerV2(SwinTransformer):
                 3: {'blocks': [0], 'ratio': 0.8},
             }
         )
-
+    
     Args:
         pretrain_img_size: pretrain image size
         in_channels: input channels
@@ -895,11 +1209,11 @@ class SwinTransformerV2(SwinTransformer):
         convert_weights: convert weights
         frozen_stages: frozen stages
         init_cfg: init config
-strategy: 'base', 'kl' or 'inc'
+    strategy: 'base', 'kl' or 'inc'
     stage_config: stage configuration for KL
     inc_stage_config: stage configuration for incremental
     """
-
+    
     def __init__(
         self,
         pretrain_img_size: int = 224,
@@ -929,13 +1243,10 @@ strategy: 'base', 'kl' or 'inc'
         strategy: str = 'base',
         stage_config: dict = None,
         inc_stage_config: dict = None,
-        # 可学习门控参数
         use_learnable_gate: bool = False,
         temperature: float = 1.0,
         lambda_kl: float = 0.1,
         lambda_inc: float = 0.1,
-        kl_gate_loss_weight: float = 1.0,
-        inc_gate_loss_weight: float = 1.0,
     ):
         self.strategy = strategy
         self.stage_config = stage_config or {}
@@ -944,9 +1255,7 @@ strategy: 'base', 'kl' or 'inc'
         self.temperature = temperature
         self.lambda_kl = lambda_kl
         self.lambda_inc = lambda_inc
-        self.kl_gate_loss_weight = kl_gate_loss_weight
-        self.inc_gate_loss_weight = inc_gate_loss_weight
-
+        
         super().__init__(
             pretrain_img_size=pretrain_img_size,
             in_channels=in_channels,
@@ -973,48 +1282,49 @@ strategy: 'base', 'kl' or 'inc'
             frozen_stages=frozen_stages,
             init_cfg=init_cfg,
         )
-
-        # 可学习门控预测器（需要在super().__init__()之后初始化）
-        self.kl_predictor = ThresholdPredictor()
-        self.inc_predictor = ThresholdPredictor()
-
-        # 注册 gate loss buffers，用于在 forward 后被训练循环获取
-        self.register_buffer('_kl_gate_loss', torch.zeros(1), persistent=False)
-        self.register_buffer('_inc_gate_loss', torch.zeros(1), persistent=False)
-
+        
+        if use_learnable_gate:
+            self.kl_predictor = ThresholdPredictor()
+            self.inc_predictor = ThresholdPredictor()
+            self.register_buffer('kl_predictor_gate_loss', torch.zeros(1))
+            self.register_buffer('inc_predictor_gate_loss', torch.zeros(1))
+        else:
+            self.kl_predictor = None
+            self.inc_predictor = None
+        
         if strategy == 'kl':
             self._replace_blocks_with_kl()
         elif strategy == 'inc':
             self._replace_blocks_with_inc()
         elif strategy == 'kl_inc':
             self._replace_blocks_with_kl_inc()
-
+    
     def _replace_blocks_with_kl(self):
         """Replace blocks with KL-enabled blocks"""
         from mmdet.models.layers import PatchMerging
-
+        
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-
+        
         num_layers = len(self.stages)
-
+        
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-
+            
             # Get stage config
             stage_cfg = self.stage_config.get(stage_idx, {})
             stage_blocks = stage_cfg.get('blocks', [])
             stage_ratio = stage_cfg.get('ratio', [])
-
+            
             # Convert single value to list
             if isinstance(stage_ratio, (int, float)):
                 stage_ratio = [stage_ratio]
-
+            
             if not stage_blocks:
                 continue
-
+            
             depth = len(stage.blocks)
-
+            
             # Get first block to extract dims
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
@@ -1038,7 +1348,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-
+            
             # Collect KL ratios for each block
             block_kl_ratios = []
             for block_idx in range(depth):
@@ -1049,9 +1359,9 @@ strategy: 'base', 'kl' or 'inc'
                     block_kl_ratios.append(kl_ratio)
                 else:
                     block_kl_ratios.append(None)
-
+            
             # Create new block sequence
-            new_stage = SwinBlockSequenceV2(
+            new_stage = SwinBlockSequenceV3(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -1076,40 +1386,40 @@ strategy: 'base', 'kl' or 'inc'
                 lambda_kl=self.lambda_kl,
                 lambda_inc=self.lambda_inc,
             )
-
+            
             # Copy blocks' parameters
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-
+            
             new_stage.downsample = stage.downsample
-
+            
             self.stages[stage_idx] = new_stage
-
+    
     def _replace_blocks_with_inc(self):
         """Replace blocks with incremental-enabled blocks"""
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-
+        
         num_layers = len(self.stages)
-
+        
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-
+            
             stage_cfg = self.inc_stage_config.get(stage_idx, {})
             stage_blocks = stage_cfg.get('blocks', [])
             stage_inc_ratio = stage_cfg.get('inc_ratio', [])
-
+            
             if isinstance(stage_inc_ratio, (int, float)):
                 stage_inc_ratio = [stage_inc_ratio]
-
+            
             if not stage_blocks:
                 continue
-
+            
             depth = len(stage.blocks)
-
+            
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
             num_heads = first_block.attn.w_msa.num_heads
@@ -1132,7 +1442,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-
+            
             block_inc_ratios = []
             for block_idx in range(depth):
                 if block_idx in stage_blocks:
@@ -1141,8 +1451,8 @@ strategy: 'base', 'kl' or 'inc'
                     block_inc_ratios.append(inc_ratio)
                 else:
                     block_inc_ratios.append(None)
-
-            new_stage = SwinBlockSequenceV2(
+            
+            new_stage = SwinBlockSequenceV3(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -1167,42 +1477,42 @@ strategy: 'base', 'kl' or 'inc'
                 lambda_kl=self.lambda_kl,
                 lambda_inc=self.lambda_inc,
             )
-
+            
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-
+            
             new_stage.downsample = stage.downsample
-
+            
             self.stages[stage_idx] = new_stage
-
+    
     def _replace_blocks_with_kl_inc(self):
         """Replace blocks with both KL and INC enabled"""
         default_act_cfg = dict(type='GELU')
         default_norm_cfg = dict(type='LN')
-
+        
         num_layers = len(self.stages)
-
+        
         for stage_idx in range(num_layers):
             stage = self.stages[stage_idx]
-
+            
             kl_stage_cfg = self.stage_config.get(stage_idx, {})
             kl_blocks = kl_stage_cfg.get('blocks', [])
             kl_ratios = kl_stage_cfg.get('ratio', [])
-
+            
             inc_stage_cfg = self.inc_stage_config.get(stage_idx, {})
             inc_blocks = inc_stage_cfg.get('blocks', [])
             inc_ratios = inc_stage_cfg.get('inc_ratio', [])
-
+            
             if isinstance(kl_ratios, (int, float)):
                 kl_ratios = [kl_ratios]
             if isinstance(inc_ratios, (int, float)):
                 inc_ratios = [inc_ratios]
-
+            
             depth = len(stage.blocks)
-
+            
             first_block = stage.blocks[0]
             embed_dims = first_block.attn.w_msa.embed_dims
             num_heads = first_block.attn.w_msa.num_heads
@@ -1225,7 +1535,7 @@ strategy: 'base', 'kl' or 'inc'
                         dp = child.drop_prob
                         break
                 drop_path_rates.append(dp)
-
+            
             block_kl_ratios = []
             block_inc_ratios = []
             for block_idx in range(depth):
@@ -1239,8 +1549,8 @@ strategy: 'base', 'kl' or 'inc'
                     inc_ratio = inc_ratios[idx_in_inc] if idx_in_inc < len(inc_ratios) else inc_ratios[-1]
                 block_kl_ratios.append(kl_ratio)
                 block_inc_ratios.append(inc_ratio)
-
-            new_stage = SwinBlockSequenceV2(
+            
+            new_stage = SwinBlockSequenceV3(
                 embed_dims=embed_dims,
                 num_heads=num_heads,
                 feedforward_channels=feedforward_channels,
@@ -1266,17 +1576,17 @@ strategy: 'base', 'kl' or 'inc'
                 lambda_kl=self.lambda_kl,
                 lambda_inc=self.lambda_inc,
             )
-
+            
             for old_block, new_block in zip(stage.blocks, new_stage.blocks):
                 new_block.norm1 = old_block.norm1
                 new_block.norm2 = old_block.norm2
                 new_block.attn = old_block.attn
                 new_block.ffn = old_block.ffn
-
+            
             new_stage.downsample = stage.downsample
-
+            
             self.stages[stage_idx] = new_stage
-
+    
     def get_strategy_config(self) -> dict:
         """Get current strategy configuration"""
         return {
@@ -1284,127 +1594,92 @@ strategy: 'base', 'kl' or 'inc'
             'stage_config': self.stage_config,
             'inc_stage_config': self.inc_stage_config,
         }
-
-    @staticmethod
-    def _align_cross_stage_features(prev_windows: torch.Tensor, prev_kl: torch.Tensor,
-                                    prev_hw_shape: tuple, prev_window_size: int = 7) -> torch.Tensor:
-        """对上一Stage的窗口特征进行KL加权池化，对齐到下一Stage的尺度
-
+    
+    def forward(self, x):
+        """Forward with cross-stage INC comparison support
+        
         Args:
-            prev_windows: 上一Stage的窗口特征 (total_windows, window_size, window_size, C)
-                          其中 total_windows = B * N_win_prev
-            prev_kl: 上一Stage的KL分数 (B, N_win_prev)
-            prev_hw_shape: 上一Stage的特征图尺寸 (H, W)
-            prev_window_size: 上一Stage的窗口大小
-
+            x: input images
+        
         Returns:
-            aligned_windows: 池化后的窗口特征 (B, N_win_next, window_size^2, C)
-        """
-        import torch.nn.functional as F
-
-        B = prev_kl.shape[0]
-        N_win_prev = prev_kl.shape[1]
-
-        H_prev, W_prev = prev_hw_shape
-        H_grid = H_prev // prev_window_size
-        W_grid = W_prev // prev_window_size
-
-        C = prev_windows.shape[-1]
-        prev_windows = prev_windows.view(B, N_win_prev, prev_window_size, prev_window_size, C)
-
-        feat_2d = prev_windows.permute(0, 4, 1, 2, 3).contiguous()
-        feat_2d = feat_2d.view(B, C, H_grid, W_grid, prev_window_size, prev_window_size)
-        feat_2d = feat_2d.permute(0, 1, 2, 4, 3, 5).contiguous()
-        feat_2d = feat_2d.view(B, C, H_prev, W_prev)
-
-        kl_2d = prev_kl.view(B, 1, H_grid, W_grid)
-
-        kl_2d = F.interpolate(kl_2d, size=(H_prev, W_prev), mode='bilinear', align_corners=False)
-
-        kl_mass = (kl_2d ** 1) + 1e-8
-
-        numerator = F.avg_pool2d(feat_2d * kl_mass, kernel_size=2, stride=2)
-        denominator = F.avg_pool2d(kl_mass, kernel_size=2, stride=2)
-        aligned_feat_2d = numerator / denominator
-
-        _, _, H_out, W_out = aligned_feat_2d.shape
-        H_out_grid = H_out // prev_window_size
-        W_out_grid = W_out // prev_window_size
-
-        aligned_windows = aligned_feat_2d.view(B, C, H_out_grid, prev_window_size, W_out_grid, prev_window_size)
-        aligned_windows = aligned_windows.permute(0, 2, 4, 3, 5, 1).contiguous()
-        aligned_windows = aligned_windows.view(B, H_out_grid * W_out_grid, prev_window_size * prev_window_size, C)
-
-        return aligned_windows
-
-    def forward(self, x: torch.Tensor) -> tuple:
-        """Forward function with cross-stage KL alignment.
-
-        Args:
-            x: input image tensor
-
-        Returns:
-            tuple: output features from each stage
+            outs: list of feature maps
         """
         x, hw_shape = self.patch_embed(x)
+        
         if self.use_abs_pos_embed:
-            x = self._pos_embed(x)
-
+            x = x + self.absolute_pos_embed
+        x = self.drop_after_pos(x)
+        
+        cross_stage_info = None
+        
         outs = []
-        kl_cache = None
-        entropy_cache = None
-        prev_windows = None
-        prev_hw_shape = hw_shape
-        prev_window_size = None
-        total_kl_gate_loss = 0.0
-        total_inc_gate_loss = 0.0
-
+        
+        if self.use_learnable_gate:
+            total_kl_gate_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+            total_inc_gate_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+        
         for i, stage in enumerate(self.stages):
-            stage_kl_loss = 0.0
-            stage_inc_loss = 0.0
-            prev_pad_hw = None
-            if isinstance(stage, SwinBlockSequenceV2):
-                stage_output = stage(x, hw_shape, kl_cache, entropy_cache, prev_windows, prev_hw_shape, prev_window_size)
-                n_out = len(stage_output)
-                if n_out == 11:
-                    x, hw_shape, x_res, out_hw_shape, kl_cache, entropy_cache, prev_windows, stage_kl_loss, stage_inc_loss, prev_pad_hw, prev_window_size = stage_output
-                else:
-                    x, hw_shape, x_res, out_hw_shape, kl_cache, entropy_cache, prev_windows, stage_kl_loss, stage_inc_loss = stage_output
-                    prev_pad_hw = None
-            else:
-                stage_output = stage(x, hw_shape)
-                n_out = len(stage_output)
-                if n_out == 4:
-                    x_down, down_hw_shape, x, hw_shape = stage_output
-                    x_res = x_down
-                    out_hw_shape = hw_shape
-                else:
-                    x, hw_shape, x_res, out_hw_shape = stage_output
-                kl_cache = None
-                entropy_cache = None
-                prev_windows = None
-                prev_pad_hw = None
-
-            if prev_pad_hw is None and prev_windows is not None:
-                ws = prev_windows.shape[1]
-                H, W = prev_hw_shape if prev_hw_shape else hw_shape
-                H_pad = ((H + ws - 1) // ws) * ws
-                W_pad = ((W + ws - 1) // ws) * ws
-                prev_pad_hw = (H_pad, W_pad)
-
-            if prev_pad_hw is not None:
-                prev_hw_shape = prev_pad_hw
-
+            if self.use_learnable_gate and hasattr(stage, 'gate_losses'):
+                stage.gate_losses = []
+            
+            B = x.shape[0]
+            input_H = hw_shape[0]
+            input_W = hw_shape[1]
+            input_C = x.shape[2]
+            window_size = stage.blocks[0].window_size if hasattr(stage.blocks[0], 'window_size') else 7
+            input_windows = (input_H // window_size) * (input_W // window_size) * B
+            
+            next_stage_info = None
+            if i < len(self.stages) - 1:
+                next_stage = self.stages[i + 1]
+                next_channel = next_stage.blocks[0].embed_dims if hasattr(next_stage.blocks[0], 'embed_dims') else next_stage.blocks[0].attn.w_msa.embed_dims
+                next_window_size = next_stage.blocks[0].window_size if hasattr(next_stage.blocks[0], 'window_size') else 7
+                next_hw_shape = (hw_shape[0] // 2, hw_shape[1] // 2)
+                next_stage_info = {
+                    'channel': next_channel,
+                    'hw_shape': next_hw_shape,
+                    'window_size': next_window_size
+                }
+            
+            x, hw_shape, out, out_hw_shape, cross_stage_info = stage(x, hw_shape, cross_stage_info, next_stage_info)
+            
+            if self.use_learnable_gate and hasattr(stage, 'gate_losses') and stage.gate_losses:
+                for b_kl_loss, b_inc_loss in stage.gate_losses:
+                    if b_kl_loss is not None:
+                        total_kl_gate_loss = total_kl_gate_loss + b_kl_loss
+                    if b_inc_loss is not None:
+                        total_inc_gate_loss = total_inc_gate_loss + b_inc_loss
+                stage.gate_losses.clear()
+            
+            kl_keep = 0
+            inc_keep = 0
+            block = stage.blocks[0]
+            kl_ratio = getattr(block, 'kl_ratio', None)
+            inc_ratio = getattr(block, 'inc_ratio', None)
+            
+            if cross_stage_info is not None:
+                kl_keep_idx = cross_stage_info.get('prev_kl_keep_idx')
+                if kl_keep_idx is not None:
+                    kl_keep = kl_keep_idx.shape[0]
+                    if kl_ratio and inc_ratio:
+                        inc_keep = max(1, int(kl_keep * inc_ratio))
+            
+            kl_ratio_str = f"{kl_ratio:.2f}" if kl_ratio else "None"
+            inc_ratio_str = f"{inc_ratio:.2f}" if inc_ratio else "None"
+            # if torch.distributed.get_rank() == 0:
+            #     print(f"[Stage {i}] Input: H={input_H}, W={input_W}, C={input_C}, windows={input_windows} (ws={window_size}) | KL: {kl_keep} ({kl_ratio_str}) | INC: {inc_keep} ({inc_ratio_str}) | Output: H={hw_shape[0]}, W={hw_shape[1]}, C={input_C}")
+            
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
-                out = norm_layer(x_res)
-                out = out.view(-1, *out_hw_shape, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                out = norm_layer(out)
+                out = out.view(-1, *out_hw_shape,
+                               self.num_features[i]).permute(0, 3, 1,
+                                                             2).contiguous()
                 outs.append(out)
-
-            total_kl_gate_loss = total_kl_gate_loss + stage_kl_loss
-            total_inc_gate_loss = total_inc_gate_loss + stage_inc_loss
-
-        # 存储 gate losses 到 buffers，由训练循环获取后加入 total loss
-        self._kl_gate_loss = torch.tensor(total_kl_gate_loss * self.kl_gate_loss_weight, device=outs[0].device if outs else 'cpu')
-        self._inc_gate_loss = torch.tensor(total_inc_gate_loss * self.inc_gate_loss_weight, device=outs[0].device if outs else 'cpu')
-        return tuple(outs)
+        
+        if self.use_learnable_gate:
+            dummy_grad = 0.0 * sum(p.sum() for p in self.parameters() if p.requires_grad)
+            self.kl_predictor_gate_loss = total_kl_gate_loss + dummy_grad
+            self.inc_predictor_gate_loss = total_inc_gate_loss + dummy_grad
+        
+        return outs

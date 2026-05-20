@@ -2,13 +2,13 @@ _base_ = [
     '../_base_/datasets/panda_detection.py', '../_base_/default_runtime.py'
 ]
 
-# pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
+pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
 work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v2_kl'
 
 find_unused_parameters=True
 model = dict(
-    type='DINOWithGateLoss',
+    type='DINO',
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
@@ -34,34 +34,23 @@ model = dict(
         out_indices=(1, 2, 3),
         with_cp=False,
         convert_weights=True,
-        # init_cfg=dict(type='Pretrained', checkpoint=pretrained),
+        init_cfg=dict(type='Pretrained', checkpoint=pretrained),
 
         # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
         strategy='kl_inc',
 
         # KL 策略配置（strategy='kl' 时生效）
         stage_config={
-            0: {'blocks': [0], 'ratio': 0.9},
-            1: {'blocks': [0], 'ratio': 0.9},
-            2: {'blocks': [0, 2, 4], 'ratio': [0.9, 0.9, 0.9]},
-            3: {'blocks': [0], 'ratio': 0.9},
+            0: {'blocks': [0], 'ratio': 1},
+            1: {'blocks': [0], 'ratio': 1},
+            2: {'blocks': [0, 2, 4], 'ratio': [0.7, 0.7, 0.7]},
+            3: {'blocks': [0], 'ratio': 0.7},
         },
 
         # 增量策略配置（strategy='inc' 时生效）
         inc_stage_config={
-            1: {'blocks': [0], 'inc_ratio': [0.9]},
-            2: {'blocks': [0, 2, 4], 'inc_ratio': [0.9, 0.9, 0.9]},
-            3: {'blocks': [0], 'inc_ratio': [0.9]},
-        },
-
-        # 可学习门控参数
-        use_learnable_gate=True,
-        temperature=1.0,
-        lambda_kl=0.1,
-        lambda_inc=0.1,
-        kl_gate_loss_weight=1.0,
-        inc_gate_loss_weight=1.0,
-    ),
+            2: {'blocks': [2, 4], 'inc_ratio': [0.7, 0.7]},
+        }),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],
@@ -171,7 +160,8 @@ optim_wrapper = dict(
         type='AdamW',
         lr=0.0001,
         weight_decay=0.0001),
-    clip_grad=dict(max_norm=0.1, norm_type=2))
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)}))
 
 max_epochs = 36
 train_cfg = dict(

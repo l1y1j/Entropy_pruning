@@ -4,7 +4,7 @@ _base_ = [
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/baseline'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/baseline_withoutpretrainedmodel'
 
 find_unused_parameters=True
 model = dict(
@@ -34,7 +34,8 @@ model = dict(
         out_indices=(1, 2, 3),
         with_cp=False,
         convert_weights=True,
-        init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
+        # init_cfg=dict(type='Pretrained', checkpoint=pretrained)
+        ),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],

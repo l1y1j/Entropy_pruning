@@ -2,9 +2,14 @@ _base_ = [
     '../_base_/datasets/panda_detection.py', '../_base_/default_runtime.py'
 ]
 
-# pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
+custom_imports = dict(
+    imports=['sparse_former.utils.entropy_vis_hook'],
+    allow_failed_imports=False
+)
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v2_kl'
+pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
+
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_2'
 
 find_unused_parameters=True
 model = dict(
@@ -19,7 +24,7 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=1),
     backbone=dict(
-        type='SwinTransformerV2',
+        type='SwinTransformerV3',
         embed_dims=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
@@ -35,33 +40,33 @@ model = dict(
         with_cp=False,
         convert_weights=True,
         # init_cfg=dict(type='Pretrained', checkpoint=pretrained),
-
+        
         # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
         strategy='kl_inc',
-
+        
         # KL 策略配置（strategy='kl' 时生效）
         stage_config={
-            0: {'blocks': [0], 'ratio': 0.9},
-            1: {'blocks': [0], 'ratio': 0.9},
-            2: {'blocks': [0, 2, 4], 'ratio': [0.9, 0.9, 0.9]},
-            3: {'blocks': [0], 'ratio': 0.9},
+            0: {'blocks': [0], 'ratio': 0.8},
+            1: {'blocks': [0], 'ratio': 0.8},
+            2: {'blocks': [0, 2, 4], 'ratio': [0.7, 0.7, 0.7]},
+            3: {'blocks': [0], 'ratio': 0.8},
         },
-
+        
         # 增量策略配置（strategy='inc' 时生效）
+        # 跨stage INC比较链: stage0.block0 → stage1.block0 → stage2.block0 → stage2.block2 → stage2.block4 → stage3.block0
         inc_stage_config={
-            1: {'blocks': [0], 'inc_ratio': [0.9]},
-            2: {'blocks': [0, 2, 4], 'inc_ratio': [0.9, 0.9, 0.9]},
-            3: {'blocks': [0], 'inc_ratio': [0.9]},
+            # 0: {'blocks': [0], 'inc_ratio': 0.8},
+            1: {'blocks': [0], 'inc_ratio': 0.8},
+            2: {'blocks': [0, 2, 4], 'inc_ratio': [0.7, 0.7, 0.7]},
+            3: {'blocks': [0], 'inc_ratio': 0.8},
         },
-
-        # 可学习门控参数
-        use_learnable_gate=True,
-        temperature=1.0,
-        lambda_kl=0.1,
-        lambda_inc=0.1,
-        kl_gate_loss_weight=1.0,
-        inc_gate_loss_weight=1.0,
-    ),
+        
+        # 可学习门控配置（使KL和INC的阈值可学习）
+        use_learnable_gate=True,  # 设为True开启可学习门控
+        temperature=1.0,           # 软掩码温度参数
+        lambda_kl=0.5,             # KL门控损失的正则化系数
+        lambda_inc=0.05,            # INC门控损失的正则化系数
+        ),
     neck=dict(
         type='ChannelMapper',
         in_channels=[192, 384, 768],
@@ -163,7 +168,8 @@ train_pipeline = [
 ]
 train_dataloader = dict(
     dataset=dict(
-        filter_cfg=dict(filter_empty_gt=False), pipeline=train_pipeline))
+        filter_cfg=dict(filter_empty_gt=False), pipeline=train_pipeline),
+    num_workers=1)
 
 optim_wrapper = dict(
     type='OptimWrapper',
@@ -172,8 +178,9 @@ optim_wrapper = dict(
         lr=0.0001,
         weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2))
+    # paramwise_cfg=dict(backbone=dict(lr_mult=0.1)))
 
-max_epochs = 36
+max_epochs = 24
 train_cfg = dict(
     type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 
@@ -191,3 +198,7 @@ param_scheduler = [
 ]
 
 auto_scale_lr = dict(base_batch_size=16)
+
+custom_hooks = [
+    dict(type='EntropyVisualizationHook', priority='VERY_HIGH')
+]

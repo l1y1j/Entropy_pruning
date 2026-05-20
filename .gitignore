@@ -3,6 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# training visualization
+*.png
+*.npy
+*.pkl
+
+# exported entropy results
+sparse_former/models/backbones/kl_scores_export/
+
 # C extensions
 *.so
 
