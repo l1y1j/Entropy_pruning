@@ -101,7 +101,7 @@ def plot_inc_histograms(data_list, output_dir, stage_filter=None, threshold_data
 
             # Add threshold line if available
             if threshold_value is not None:
-                threshold_mass = threshold_value ** 2
+                threshold_mass = threshold_value ** 1
                 axes[0].axvline(x=threshold_mass, color='red', linestyle='--', linewidth=2,
                                 label=f'Learned Threshold: {threshold_mass:.4f}')
                 axes[0].legend(loc='upper right', fontsize=10)
@@ -113,7 +113,7 @@ def plot_inc_histograms(data_list, output_dir, stage_filter=None, threshold_data
 
             # Add learned threshold as vertical line in cumulative curve
             if threshold_value is not None:
-                threshold_mass = threshold_value ** 2
+                threshold_mass = threshold_value ** 1
                 above_threshold = mass_sorted >= threshold_mass
                 token_pct_at_threshold = (np.sum(above_threshold) / len(mass_sorted)) * 100
                 axes[1].axvline(x=token_pct_at_threshold, color='purple', linestyle='-.', linewidth=2,
@@ -139,8 +139,10 @@ def plot_inc_histograms(data_list, output_dir, stage_filter=None, threshold_data
 
 def main():
     parser = argparse.ArgumentParser(description='Plot INC score histograms and cumulative curves')
+    parser.add_argument('--base_dir', type=str, default=None,
+                        help='Base directory containing epoch_* folders with scores (default: auto-detect)')
     parser.add_argument('--data_path', type=str, default=None,
-                        help='Path to inc_scores.pkl file (default: auto-detect from epoch dir)')
+                        help='Full path to inc_scores.pkl file (overrides --base_dir)')
     parser.add_argument('--epoch', type=str, default='latest',
                         help='Epoch to visualize (e.g., "001", "latest")')
     parser.add_argument('--stage', type=int, default=None,
@@ -154,6 +156,18 @@ def main():
     # Determine data path
     if args.data_path:
         data_path = Path(args.data_path)
+    elif args.base_dir:
+        base_dir = Path(args.base_dir)
+        if args.epoch == 'latest':
+            epoch_dirs = sorted([d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith('epoch_')],
+                                key=lambda x: int(x.name.split('_')[1]))
+            if epoch_dirs:
+                data_path = epoch_dirs[-1] / 'inc_scores.pkl'
+            else:
+                print(f"No epoch directories found in {base_dir}")
+                return
+        else:
+            data_path = base_dir / f'epoch_{args.epoch}' / 'inc_scores.pkl'
     else:
         # Auto-detect from kl_scores_export directory
         base_dir = Path(__file__).parent / 'kl_scores_export'

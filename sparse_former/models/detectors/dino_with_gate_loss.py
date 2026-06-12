@@ -8,7 +8,8 @@ class DINOWithGateLoss(DINO):
     """DINO detector with additional gate loss from SwinTransformerV2 backbone."""
 
     def loss(self, batch_inputs, batch_data_samples):
-        img_feats = self.extract_feat(batch_inputs)
+        # img_feats = self.extract_feat(batch_inputs)
+        img_feats = list(self.extract_feat(batch_inputs))
         
         # 数值检查：确保 backbone 输出的特征不包含 NaN/Inf
         # 使用极小的随机噪声代替 0.0，防止 LayerNorm 方差为 0 导致新的 Inf
@@ -27,14 +28,30 @@ class DINOWithGateLoss(DINO):
         
         losses = self.bbox_head.loss(**head_inputs_dict, batch_data_samples=batch_data_samples)
 
-        # Add gate loss from SwinTransformerV3 backbone (V2 uses _kl_gate_loss/_inc_gate_loss)
+        # Add gate loss from SwinTransformerV3 backbone
         if hasattr(self.backbone, 'kl_predictor_gate_loss'):
             kl_loss = self.backbone.kl_predictor_gate_loss
             if kl_loss is not None and isinstance(kl_loss, torch.Tensor):
                 losses['loss_kl_gate'] = kl_loss
+        if hasattr(self.backbone, 'kl_predictor_gate_info'):
+            kl_info = self.backbone.kl_predictor_gate_info
+            if kl_info is not None and isinstance(kl_info, torch.Tensor):
+                losses['loss_kl_gate_info'] = kl_info
+        if hasattr(self.backbone, 'kl_predictor_gate_reg'):
+            kl_reg = self.backbone.kl_predictor_gate_reg
+            if kl_reg is not None and isinstance(kl_reg, torch.Tensor):
+                losses['loss_kl_gate_reg'] = kl_reg
         if hasattr(self.backbone, 'inc_predictor_gate_loss'):
             inc_loss = self.backbone.inc_predictor_gate_loss
             if inc_loss is not None and isinstance(inc_loss, torch.Tensor):
                 losses['loss_inc_gate'] = inc_loss
+        if hasattr(self.backbone, 'inc_predictor_gate_info'):
+            inc_info = self.backbone.inc_predictor_gate_info
+            if inc_info is not None and isinstance(inc_info, torch.Tensor):
+                losses['loss_inc_gate_info'] = inc_info
+        if hasattr(self.backbone, 'inc_predictor_gate_reg'):
+            inc_reg = self.backbone.inc_predictor_gate_reg
+            if inc_reg is not None and isinstance(inc_reg, torch.Tensor):
+                losses['loss_inc_gate_reg'] = inc_reg
 
         return losses

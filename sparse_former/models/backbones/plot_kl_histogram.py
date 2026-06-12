@@ -98,7 +98,7 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
             # Add threshold line if available
             if threshold_value is not None:
                 # Convert threshold to info_mass space (normalized_kl is 0-1, info_mass is normalized_kl^2)
-                threshold_mass = threshold_value ** 2
+                threshold_mass = threshold_value ** 1
                 axes[0].axvline(x=threshold_mass, color='red', linestyle='--', linewidth=2,
                                 label=f'Learned Threshold: {threshold_mass:.4f}')
                 axes[0].legend(loc='upper right', fontsize=10)
@@ -114,7 +114,7 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
                 # On cumulative curve, we need to find what token percentage corresponds to this threshold
                 # Tokens are sorted by info_mass descending, so threshold corresponds to
                 # the percentage of tokens with info_mass >= threshold^2
-                above_threshold = mass_sorted >= (threshold_value ** 2)
+                above_threshold = mass_sorted >= (threshold_value ** 1)
                 token_pct_at_threshold = (np.sum(above_threshold) / len(mass_sorted)) * 100
                 axes[1].axvline(x=token_pct_at_threshold, color='purple', linestyle='-.', linewidth=2,
                                 label=f'Learned Threshold: {token_pct_at_threshold:.1f}% tokens')
@@ -139,8 +139,10 @@ def plot_kl_histograms(data_list, output_dir, stage_filter=None, threshold_data=
 
 def main():
     parser = argparse.ArgumentParser(description='Plot KL score histograms and cumulative curves')
+    parser.add_argument('--base_dir', type=str, default=None,
+                        help='Base directory containing epoch_* folders with scores (default: auto-detect)')
     parser.add_argument('--data_path', type=str, default=None,
-                        help='Path to kl_scores.pkl file (default: auto-detect from epoch dir)')
+                        help='Full path to kl_scores.pkl file (overrides --base_dir)')
     parser.add_argument('--epoch', type=str, default='latest',
                         help='Epoch to visualize (e.g., "001", "latest")')
     parser.add_argument('--stage', type=int, default=None,
@@ -154,6 +156,18 @@ def main():
     # Determine data path
     if args.data_path:
         data_path = Path(args.data_path)
+    elif args.base_dir:
+        base_dir = Path(args.base_dir)
+        if args.epoch == 'latest':
+            epoch_dirs = sorted([d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith('epoch_')],
+                                key=lambda x: int(x.name.split('_')[1]))
+            if epoch_dirs:
+                data_path = epoch_dirs[-1] / 'kl_scores.pkl'
+            else:
+                print(f"No epoch directories found in {base_dir}")
+                return
+        else:
+            data_path = base_dir / f'epoch_{args.epoch}' / 'kl_scores.pkl'
     else:
         # Auto-detect from kl_scores_export directory
         base_dir = Path(__file__).parent / 'kl_scores_export'

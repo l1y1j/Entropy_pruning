@@ -55,8 +55,11 @@ class EntropyVisualizationHook(Hook):
         """在每个epoch开始时更新epoch信息并注册收集配置"""
         # Import here to avoid circular import
         from sparse_former.models.backbones.swin_baseline_v3 import (
-            set_epoch, register_enabled_collections, reset_collectors
+            set_epoch, register_enabled_collections, reset_collectors, set_export_base_path
         )
+
+        # 设置 KL/INC 分数导出路径到 work_dir
+        set_export_base_path(runner.work_dir)
 
         current_epoch = runner.epoch
         set_epoch(current_epoch)
