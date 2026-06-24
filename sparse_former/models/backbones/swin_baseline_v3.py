@@ -245,7 +245,7 @@ class ThresholdPredictor(nn.Module):
             nn.Linear(hidden_dim + 32, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
+            # 无 Sigmoid：输出 τ_raw ∈ (-∞, +∞)，sigmoid 移至外部与 stage_policy 合并
         )
 
     def forward(
@@ -338,10 +338,12 @@ def collect_stats(
     scores = scores.detach()
 
     B = batch_size
-    N = scores.shape[0] // B
+    device = scores.device
+    N = int(scores.shape[0]) // int(B)
     scores_per_batch = scores.view(B, N)
 
     if mask is not None:
+        mask = mask.to(device)
         mask_bool = mask.detach().bool()
         mask_float = mask_bool.float()
 
@@ -358,8 +360,9 @@ def collect_stats(
         scores_for_sort[~mask_bool] = 1e9
         scores_sorted = scores_for_sort.sort(dim=1)[0]
 
-        mid_idx = (count // 2).clamp(max=N - 1).long()
-        batch_idx = torch.arange(B, device=scores.device).unsqueeze(1)
+        max_n = torch.tensor(N - 1, dtype=torch.long, device=device)
+        mid_idx = (count // 2).clamp(max=max_n).long()
+        batch_idx = torch.arange(B, device=device).unsqueeze(1)
         p50 = scores_sorted[batch_idx, mid_idx]
 
         scores_for_max = scores_per_batch.clone()
@@ -374,6 +377,76 @@ def collect_stats(
     p50 = scores_per_batch.quantile(0.5, dim=1, keepdim=True)
     max_val = scores_per_batch.max(dim=1, keepdim=True)[0]
     return mean, std, p50, max_val
+
+
+def compute_erank(scores_2d: torch.Tensor) -> torch.Tensor:
+    """从 window scores 计算图像级复杂度 C_b（梯度安全阻断）
+
+    C_b = eRank / N ∈ [1/N, 1]，衡量窗口分数分布的均匀程度。
+    值越大 → 分布越均匀 → 图像信息越分散 → 图像越"难"。
+
+    ⚠️ 必须 detach：C_b 是纯环境变量，不允许梯度通过 scores 回传，
+    否则网络会通过拉平所有窗口分数来"作弊"降低剪枝惩罚。
+
+    Args:
+        scores_2d: (B, N) window scores（KL 或 INC），已 reshape 为 2D
+
+    Returns:
+        C_b: (B, 1) 图像复杂度，已 detach
+    """
+    scores_2d = scores_2d.detach()  # 入口阻断，双保险
+    B, N = scores_2d.shape
+    probs = F.softmax(scores_2d, dim=-1)
+    H = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # (B,)
+    e_rank = torch.exp(H)  # (B,)
+    C_b = (e_rank / N).unsqueeze(-1)  # (B, 1)
+    return torch.clamp(C_b, 0.0, 1.0)  # clamp 防极端值
+
+
+# ==========================================================================
+# tau debug: 记录 tau_raw / stage_policy / C_b / bias / τ 的数值关系
+# ==========================================================================
+_TAU_DEBUG_COUNTER = 0
+_TAU_DEBUG_MAX = 3000
+
+
+def _write_tau_debug(strategy, stage, block, tau_raw, tau, C_b, stage_policy_val):
+    global _TAU_DEBUG_COUNTER
+    import os
+
+    bias = stage_policy_val * C_b  # (B, 1)，核心量：stage_policy 对 τ 的实际贡献
+
+    tau_raw_abs = tau_raw.abs().mean().item()
+    bias_abs = bias.abs().mean().item()
+    ratio = bias_abs / (tau_raw_abs + 1e-6)
+
+    path = os.path.join(_export_base_path if _export_base_path else '/tmp', 'tau_debug.csv')
+    if _TAU_DEBUG_COUNTER == 0:
+        with open(path, 'w') as f:
+            f.write(
+                "iter,strategy,stage,block,"
+                "tau_raw_mean,tau_raw_std,tau_raw_abs,tau_raw_min,tau_raw_max,"
+                "stage_policy,"
+                "Cb_mean,Cb_std,"
+                "bias_mean,bias_std,bias_abs,"
+                "tau_mean,tau_std,tau_min,tau_max,"
+                "ratio\n"
+            )
+
+    with open(path, 'a') as f:
+        f.write(
+            f"{_TAU_DEBUG_COUNTER},{strategy},{stage},{block},"
+            f"{tau_raw.mean().item():.6f},{tau_raw.std().item():.6f},"
+            f"{tau_raw_abs:.6f},{tau_raw.min().item():.6f},{tau_raw.max().item():.6f},"
+            f"{stage_policy_val.item():.6f},"
+            f"{C_b.mean().item():.6f},{C_b.std().item():.6f},"
+            f"{bias.mean().item():.6f},{bias.std().item():.6f},{bias_abs:.6f},"
+            f"{tau.mean().item():.6f},{tau.std().item():.6f},"
+            f"{tau.min().item():.6f},{tau.max().item():.6f},"
+            f"{ratio:.6f}\n"
+        )
+
+    _TAU_DEBUG_COUNTER += 1
 
 
 def compute_gate_loss(
@@ -722,6 +795,7 @@ class SwinBlockV3(nn.Module):
         entropy_cache: torch.Tensor = None,
         prev_aligned_entropy: torch.Tensor = None,
         prev_kl_keep_idx: torch.Tensor = None,
+        C_b: torch.Tensor = None,
     ) -> tuple:
         """Forward function
 
@@ -731,6 +805,7 @@ class SwinBlockV3(nn.Module):
             entropy_cache: entropy from previous W-MSA in same stage for INC comparison
             prev_aligned_entropy: entropy from previous stage for cross-stage INC comparison
             prev_kl_keep_idx: KL keep indices from previous stage
+            C_b: image-level complexity from Stage 0 (reused across all stages)
 
         Returns:
             x: output features
@@ -768,13 +843,13 @@ class SwinBlockV3(nn.Module):
         if self.strategy is not None:
             if self.strategy == "kl_inc" and can_prune_kl and can_prune_inc:
                 return self._forward_kl_inc(
-                    x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx
+                    x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx, C_b=C_b
                 )
             elif self.strategy in ["kl", "kl_inc"] and can_prune_kl:
-                return self._forward_kl(x, hw_shape)
+                return self._forward_kl(x, hw_shape, C_b=C_b)
             elif self.strategy in ["inc", "kl_inc"] and can_prune_inc:
                 return self._forward_inc(
-                    x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx
+                    x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx, C_b=C_b
                 )
 
         return (
@@ -805,7 +880,7 @@ class SwinBlockV3(nn.Module):
 
         return x
 
-    def _forward_kl(self, x: torch.Tensor, hw_shape: tuple) -> tuple:
+    def _forward_kl(self, x: torch.Tensor, hw_shape: tuple, C_b: torch.Tensor = None) -> tuple:
         """KL pruning forward with dynamic threshold + soft mask injection"""
         B, L, C = x.shape
         H, W = hw_shape
@@ -837,12 +912,20 @@ class SwinBlockV3(nn.Module):
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- Step 1: MLP 预测阈值 (输入为原始分数统计量) -----
+        # ----- Step 1: MLP 预测 τ_raw (无 sigmoid) -----
         scores_flat = window_scores_reshaped.view(-1)
         stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        kl_threshold = self.kl_predictor(
+        tau_raw = self.kl_predictor(
             stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1)
+        )  # (B, 1) raw logit
+
+        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
+        if C_b is None:
+            C_b = compute_erank(window_scores_reshaped)  # (B, 1)，首次计算
+        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
+
+        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
+        tau = torch.sigmoid(tau_raw + self.kl_predictor.stage_policy[self.stage_idx])  # (B, 1)
 
         # ----- Step 2: Min-Max 归一化 (用于比较) -----
         scores_min = window_scores_reshaped.min(dim=1, keepdim=True)[0]
@@ -852,16 +935,16 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- Step 3: 软掩码计算 -----
-        kl_threshold_tiled = kl_threshold.squeeze(-1).unsqueeze(
+        tau_tiled = tau.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_kl = torch.sigmoid(
-            (kl_norm_scores - kl_threshold_tiled) / self.temperature
+            (kl_norm_scores - tau_tiled) / self.temperature
         )
         # m_mask_kl = torch.clamp(m_mask_kl, min=1e-6, max=1 - 1e-6)
 
         # ----- Step 4: 硬掩码 + Fallback -----
-        kl_keep_mask = kl_norm_scores > kl_threshold  # (B, N_win)
+        kl_keep_mask = kl_norm_scores > tau  # (B, N_win)
         # fallback: 每张图至少保留分数最高的窗口
         # fallback = torch.zeros_like(kl_keep_mask)
         # fallback[
@@ -923,7 +1006,7 @@ class SwinBlockV3(nn.Module):
             self.kl_gate_loss = kl_loss
             for b in range(B):
                 collect_threshold(
-                    kl_threshold[b].item(), self.stage_idx, self.block_idx, "kl"
+                    tau[b].item(), self.stage_idx, self.block_idx, "kl"
                 )
             block_gate_loss = (kl_loss, None, kl_info, kl_reg, None, None)
 
@@ -951,6 +1034,7 @@ class SwinBlockV3(nn.Module):
         entropy_cache: torch.Tensor = None,
         prev_aligned_entropy: torch.Tensor = None,
         prev_kl_keep_idx: torch.Tensor = None,
+        C_b: torch.Tensor = None,
     ) -> tuple:
         """Incremental pruning forward with dynamic threshold + soft mask injection
 
@@ -1009,12 +1093,20 @@ class SwinBlockV3(nn.Module):
         inc_scores_reshaped = inc_scores.view(B, -1)
         _collect_inc_scores(inc_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- Step 1: MLP 预测阈值 (输入为原始分数统计量) -----
+        # ----- Step 1: MLP 预测 τ_raw (无 sigmoid) -----
         scores_flat = inc_scores_reshaped.view(-1)
         stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        inc_threshold = self.inc_predictor(
+        tau_raw = self.inc_predictor(
             stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1)
+        )  # (B, 1) raw logit
+
+        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
+        if C_b is None:
+            C_b = compute_erank(inc_scores_reshaped)  # (B, 1)，首次计算
+        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
+
+        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
+        tau = torch.sigmoid(tau_raw + self.inc_predictor.stage_policy[self.stage_idx])  # (B, 1)
 
         # ----- Step 2: Min-Max 归一化 -----
         scores_min = inc_scores_reshaped.min(dim=1, keepdim=True)[0]
@@ -1024,16 +1116,16 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- Step 3: 软掩码计算 -----
-        inc_threshold_tiled = inc_threshold.squeeze(-1).unsqueeze(
+        tau_tiled = tau.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_inc = torch.sigmoid(
-            (inc_norm_scores - inc_threshold_tiled) / self.temperature
+            (inc_norm_scores - tau_tiled) / self.temperature
         )
         m_mask_inc = torch.clamp(m_mask_inc, min=1e-6, max=1 - 1e-6)
 
         # ----- Step 4: 硬掩码 + Fallback -----
-        inc_keep_mask = inc_norm_scores > inc_threshold  # (B, N_win)
+        inc_keep_mask = inc_norm_scores > tau  # (B, N_win)
         fallback = torch.zeros_like(inc_keep_mask)
         fallback[
             torch.arange(B, device=x.device), inc_scores_reshaped.argmax(dim=1)
@@ -1082,7 +1174,7 @@ class SwinBlockV3(nn.Module):
             self.inc_gate_loss = inc_loss
             for b in range(B):
                 collect_threshold(
-                    inc_threshold[b].item(), self.stage_idx, self.block_idx, "inc"
+                    tau[b].item(), self.stage_idx, self.block_idx, "inc"
                 )
             block_gate_loss = (None, inc_loss, None, None, inc_info, inc_reg)
 
@@ -1107,6 +1199,7 @@ class SwinBlockV3(nn.Module):
         entropy_cache: torch.Tensor = None,
         prev_aligned_entropy: torch.Tensor = None,
         prev_kl_keep_idx: torch.Tensor = None,
+        C_b: torch.Tensor = None,
     ) -> tuple:
         """KL + INC 串联动态阈值剪枝 with soft mask injection
 
@@ -1145,12 +1238,25 @@ class SwinBlockV3(nn.Module):
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- KL: MLP 预测阈值 (输入为原始分数统计量) -----
+        # ----- KL: MLP 预测 τ_raw (无 sigmoid) -----
         scores_flat = window_scores_reshaped.view(-1)
         stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        kl_threshold = self.kl_predictor(
+        tau_raw = self.kl_predictor(
             stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1)
+        )  # (B, 1) raw logit
+
+        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
+        if C_b is None:
+            C_b = compute_erank(window_scores_reshaped)  # (B, 1)，首次计算
+        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
+
+        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
+        tau = torch.sigmoid(tau_raw + self.kl_predictor.stage_policy[self.stage_idx])  # (B, 1)
+
+        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
+            _write_tau_debug('kl', self.stage_idx, self.block_idx,
+                             tau_raw, tau, C_b,
+                             self.kl_predictor.stage_policy[self.stage_idx])
 
         # ----- KL: Min-Max 归一化 -----
         scores_min = window_scores_reshaped.min(dim=1, keepdim=True)[0]
@@ -1160,16 +1266,16 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- KL: 软掩码计算 -----
-        kl_threshold_tiled = kl_threshold.squeeze(-1).unsqueeze(
+        tau_tiled = tau.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_kl = torch.sigmoid(
-            (kl_norm_scores - kl_threshold_tiled) / self.temperature
+            (kl_norm_scores - tau_tiled) / self.temperature
         )
         m_mask_kl = torch.clamp(m_mask_kl, min=1e-6, max=1 - 1e-6)
 
         # ----- KL: 硬掩码 + Fallback -----
-        kl_keep_mask = kl_norm_scores > kl_threshold  # (B, N_win)
+        kl_keep_mask = kl_norm_scores > tau  # (B, N_win)
         fallback = torch.zeros_like(kl_keep_mask)
         fallback[
             torch.arange(B, device=x.device), window_scores_reshaped.argmax(dim=1)
@@ -1226,16 +1332,26 @@ class SwinBlockV3(nn.Module):
         inc_scores_full.view(-1)[kl_keep_idx_flat] = inc_scores_survived
         _collect_inc_scores(inc_scores_full, self.stage_idx, self.block_idx)
 
-        # ----- INC: MLP 预测阈值 (输入为全尺寸原始分数) -----
+        # ----- INC: MLP 预测 τ_raw (无 sigmoid) -----
         # 必须用 inc_scores_full.view(-1) 而不是 inc_scores_survived.view(-1)
         # 因为后者长度 = N_kl (动态)，无法 view(B, N_win)
         raw_inc_scores_flat = inc_scores_full.view(-1)
         stats_mean, stats_std, stats_p50, stats_max = collect_stats(
             raw_inc_scores_flat, B, mask=kl_keep_mask
         )
-        inc_threshold = self.inc_predictor(
+        tau_raw = self.inc_predictor(
             stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1)
+        )  # (B, 1) raw logit
+
+        # 图像级复杂度 C_b（复用 KL 路径计算结果，不重复计算）
+
+        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
+        tau = torch.sigmoid(tau_raw + self.inc_predictor.stage_policy[self.stage_idx])  # (B, 1)
+
+        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
+            _write_tau_debug('inc', self.stage_idx, self.block_idx,
+                             tau_raw, tau, C_b,
+                             self.inc_predictor.stage_policy[self.stage_idx])
 
         # ----- INC: Min-Max 归一化 (纯 GPU 加速版，无 CPU 同步) -----
         # 用极值填充被排除的窗口，安全地按 Batch 计算极值
@@ -1259,11 +1375,11 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- INC: 软掩码计算 -----
-        inc_threshold_tiled = inc_threshold.squeeze(-1).unsqueeze(
+        tau_tiled = tau.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_inc = torch.sigmoid(
-            (inc_norm_scores - inc_threshold_tiled) / self.temperature
+            (inc_norm_scores - tau_tiled) / self.temperature
         )
         m_mask_inc = torch.clamp(m_mask_inc, min=1e-6, max=1 - 1e-6)
 
@@ -1273,7 +1389,7 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- INC: 硬掩码 + Fallback (INC 必须是 KL 的子集) -----
-        inc_keep_mask = (inc_norm_scores > inc_threshold) & kl_keep_mask
+        inc_keep_mask = (inc_norm_scores > tau) & kl_keep_mask
         inc_fallback = torch.zeros_like(inc_keep_mask)
         inc_fallback[
             torch.arange(B, device=x.device), inc_scores_full.argmax(dim=1)
@@ -1339,7 +1455,7 @@ class SwinBlockV3(nn.Module):
                 self.kl_gate_loss = kl_loss
                 for b in range(B):
                     collect_threshold(
-                        kl_threshold[b].item(), self.stage_idx, self.block_idx, "kl"
+                        tau[b].item(), self.stage_idx, self.block_idx, "kl"
                     )
 
             if self.inc_predictor is not None and inc_scores_full.numel() > 0:
@@ -1352,7 +1468,7 @@ class SwinBlockV3(nn.Module):
                 self.inc_gate_loss = inc_loss
                 for b in range(B):
                     collect_threshold(
-                        inc_threshold[b].item(), self.stage_idx, self.block_idx, "inc"
+                        tau[b].item(), self.stage_idx, self.block_idx, "inc"
                     )
 
             block_gate_loss = (kl_loss, inc_loss, kl_info, kl_reg, inc_info, inc_reg)
@@ -1563,18 +1679,24 @@ class SwinBlockSequenceV3(nn.Module):
 
         prev_aligned_entropy = None
         prev_kl_keep_idx = None
+        C_b = None
         if prev_cross_stage_info is not None:
             prev_aligned_entropy = prev_cross_stage_info.get(
                 "prev_aligned_entropy", None
             )
             prev_kl_keep_idx = prev_cross_stage_info.get("prev_kl_keep_idx", None)
+            C_b = prev_cross_stage_info.get("C_b", None)  # 从上游 stage 获取全局 C_b
 
         last_wmsa_info = None
 
         for i, block in enumerate(self.blocks):
             result = block(
-                x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx
+                x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx, C_b=C_b
             )
+
+            # 第一个 W-MSA block 会计算 C_b 并存入 block._C_b
+            if C_b is None and hasattr(block, '_C_b') and block._C_b is not None:
+                C_b = block._C_b
 
             if isinstance(result, tuple) and len(result) >= 8:
                 x = result[0]
@@ -1621,6 +1743,7 @@ class SwinBlockSequenceV3(nn.Module):
                 "prev_channel": last_wmsa_info["channel"],
                 "prev_hw_shape": last_wmsa_info["hw_shape"],
                 "window_size": self.blocks[0].window_size,
+                "C_b": C_b,  # Stage 0 计算的全局图像复杂度，全 stage 复用
             }
 
             if next_stage_info is not None:
@@ -1643,6 +1766,7 @@ class SwinBlockSequenceV3(nn.Module):
                     "prev_channel": next_stage_info["channel"],
                     "prev_hw_shape": next_stage_info["hw_shape"],
                     "window_size": next_stage_info["window_size"],
+                    "C_b": C_b,  # Stage 0 计算的全局图像复杂度，全 stage 复用
                 }
             else:
                 cross_stage_info = base_cross_stage_info
@@ -1782,6 +1906,10 @@ class SwinTransformerV3(SwinTransformer):
         if use_learnable_gate:
             self.kl_predictor = ThresholdPredictor()
             self.inc_predictor = ThresholdPredictor()
+            # 将 stage_policy 直接挂载到 predictor 上，零侵入传参
+            num_stages = len(depths)
+            self.kl_predictor.stage_policy = nn.Parameter(torch.zeros(num_stages))
+            self.inc_predictor.stage_policy = nn.Parameter(torch.zeros(num_stages))
             self.register_buffer("kl_predictor_gate_loss", torch.zeros(1))
             self.register_buffer("inc_predictor_gate_loss", torch.zeros(1))
             self.register_buffer("kl_predictor_gate_info", torch.zeros(1))
