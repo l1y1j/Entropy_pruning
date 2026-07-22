@@ -9,7 +9,7 @@ custom_imports = dict(
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_kl_inc/14'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_klonly/4'
 
 find_unused_parameters=True
 model = dict(
@@ -42,8 +42,8 @@ model = dict(
         # init_cfg=dict(type='Pretrained', checkpoint=pretrained),
         
         # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
-        strategy='kl_inc',
-        
+        strategy='kl',
+
         # KL 策略配置（strategy='kl' 时生效）
         stage_config={
             0: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
@@ -53,19 +53,19 @@ model = dict(
         },
 
         # 增量策略配置（strategy='inc' 时生效）
-        inc_stage_config={
-            # 0: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-            0: {'blocks': [1], 'inc_ratio': 0.7},
-            1: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-            2: {'blocks': [0, 1, 2, 3, 4, 5], 'inc_ratio': [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]},
-            3: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-        },
+        # 跨stage INC比较链: stage0.block0 → stage1.block0 → stage2.block0 → stage2.block2 → stage2.block4 → stage3.block0
+        # inc_stage_config={
+        #     # 0: {'blocks': [0], 'inc_ratio': 0.8},
+        #     1: {'blocks': [0], 'inc_ratio': 0.7},
+        #     2: {'blocks': [0, 2, 4], 'inc_ratio': [0.7, 0.7, 0.7]},
+        #     3: {'blocks': [0], 'inc_ratio': 0.7},
+        # },
         
         # 可学习门控配置（使KL和INC的阈值可学习）
         use_learnable_gate=True,  # 设为True开启可学习门控
         temperature=0.5,           # 软掩码温度参数
         lambda_kl=4.0,             # KL门控损失的正则化系数
-        lambda_inc=4.0,            # INC门控损失的正则化系数
+        # lambda_inc=1.0,            # INC门控损失的正则化系数
         ),
     neck=dict(
         type='ChannelMapper',

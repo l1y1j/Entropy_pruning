@@ -30,6 +30,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Get a detector flops')
     parser.add_argument('config', help='train config file path')
     parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default=None,
+        help='checkpoint file path')
+    parser.add_argument(
         '--num-images',
         type=int,
         default=100,
@@ -141,6 +146,9 @@ def inference(args, logger):
     avg_flops = []
     data_loader = Runner.build_dataloader(cfg.val_dataloader)
     model = MODELS.build(cfg.model)
+    if args.checkpoint:
+        from mmengine.runner import load_checkpoint
+        load_checkpoint(model, args.checkpoint, map_location='cpu')
     if torch.cuda.is_available():
         model = model.cuda()
     model = revert_sync_batchnorm(model)

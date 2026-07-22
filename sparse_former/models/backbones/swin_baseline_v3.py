@@ -232,7 +232,7 @@ class ThresholdPredictor(nn.Module):
         super().__init__()
         # 统计量直接线性映射（不再用LayerNorm）
         self.stat_encoder = nn.Sequential(
-            nn.Linear(4, hidden_dim),
+            nn.Linear(17, hidden_dim),  # 16-bin soft histogram + C_b
             nn.ReLU(),
         )
         # 强位置编码 - Embedding替代归一化标量
@@ -245,36 +245,34 @@ class ThresholdPredictor(nn.Module):
             nn.Linear(hidden_dim + 32, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
-            # 无 Sigmoid：输出 τ_raw ∈ (-∞, +∞)，sigmoid 移至外部与 stage_policy 合并
+            nn.Sigmoid(),
         )
 
     def forward(
-        self, stats_mean, stats_std, stats_p50, stats_max, stage_idx, block_idx
+        self, soft_hist, C_b, stage_idx, block_idx
     ):
         """
         Args:
-            stats_mean: (B, 1) 分数均值
-            stats_std: (B, 1) 分数标准差
-            stats_p50: (B, 1) 分数中位数
-            stats_max: (B, 1) 分数最大值
+            soft_hist: (B, 16) 16-bin soft histogram of window scores, sum=1
+            C_b: (B, 1) 图像级复杂度（全局，同一张图所有 block 共用）
             stage_idx: int 或 (B,) 当前stage索引
             block_idx: int 或 (B,) 当前block索引
 
         Returns:
-            threshold: (B, 1) 预测的阈值τ
+            threshold: (B, 1) 预测的阈值τ ∈ [0, 1]
         """
         # 处理 stage_idx 和 block_idx 类型（可能是Python int或tensor）
         if not isinstance(stage_idx, torch.Tensor):
-            stage_idx = torch.tensor([stage_idx], device=stats_mean.device, dtype=torch.long)
-            if stats_mean.shape[0] > 1:
-                stage_idx = stage_idx.expand(stats_mean.shape[0])
+            stage_idx = torch.tensor([stage_idx], device=soft_hist.device, dtype=torch.long)
+            if soft_hist.shape[0] > 1:
+                stage_idx = stage_idx.expand(soft_hist.shape[0])
         if not isinstance(block_idx, torch.Tensor):
-            block_idx = torch.tensor([block_idx], device=stats_mean.device, dtype=torch.long)
-            if stats_mean.shape[0] > 1:
-                block_idx = block_idx.expand(stats_mean.shape[0])
+            block_idx = torch.tensor([block_idx], device=soft_hist.device, dtype=torch.long)
+            if soft_hist.shape[0] > 1:
+                block_idx = block_idx.expand(soft_hist.shape[0])
 
-        # 统计量直接concat，不做LayerNorm
-        stats = torch.cat([stats_mean, stats_std, stats_p50, stats_max], dim=1)  # (B, 4)
+        # soft histogram + C_b concat
+        stats = torch.cat([soft_hist, C_b], dim=1)  # (B, 17)
         h_stat = self.stat_encoder(stats)  # (B, hidden_dim)
 
         # Embedding位置编码
@@ -283,7 +281,7 @@ class ThresholdPredictor(nn.Module):
 
         # 融合
         h = torch.cat([h_stat, h_stage, h_block], dim=1)
-        return self.net(h)  # (B, 1)
+        return self.net(h)  # (B, 1) ∈ [0, 1]
 
 
 # ==========================================================================
@@ -379,6 +377,93 @@ def collect_stats(
     return mean, std, p50, max_val
 
 
+def compute_soft_histogram(scores_flat, B, K=16, sigma=0.08):
+    """将窗口分数分布映射为可微 soft histogram。
+
+    先 detach，再用高斯核将每个窗口软分配到 K 个 bin 上，所有窗口平均后得到分布。
+
+    Args:
+        scores_flat: (B*N,) 已归一化到 [0,1] 的分数
+        B: batch size
+        K: bin 数量 (16)
+        sigma: 高斯核宽度 (0.08 ≈ 1.28 个 bin 宽度)
+
+    Returns:
+        hist: (B, K) soft histogram, sum=1
+    """
+    scores_2d = scores_flat.detach().view(B, -1)  # (B, N)
+
+    # bin 中心: (j+0.5)/K, j=0..K-1 → [0.03125, 0.09375, ..., 0.96875]
+    centers = torch.linspace(0.5 / K, 1.0 - 0.5 / K, K, device=scores_2d.device)
+
+    # (B,N,1) - (K,) → (B,N,K)
+    dist = scores_2d.unsqueeze(-1) - centers.view(1, 1, K)
+
+    # 高斯核
+    w = torch.exp(-(dist ** 2) / (2 * sigma ** 2))
+
+    # 每个窗口对所有 bin 归一化
+    w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # 所有窗口平均 → 分布
+    hist = w.mean(dim=1)  # (B, K), sum≈1
+
+    return hist
+
+
+def compute_erb_from_conv(x_conv, window_size):
+    """从 patch_embed Conv2d 输出（LayerNorm 之前）计算图像复杂度 C_b
+
+    LN 之前，Conv 输出的幅值直接反映局部纹理/边缘响应强度：
+    - 平坦区域：激活值极小 → 窗口能量低
+    - 高频区域：强烈激活    → 窗口能量高
+    能量分布的熵转化为 C_b ∈ [0, 1]。
+
+    Args:
+        x_conv: (B, C, H, W) patch_embed.projection 的输出，未经过 LN
+        window_size: int, Swin 的 window_size（默认 7）
+
+    Returns:
+        C_b: (B, 1) 图像复杂度，已 detach
+    """
+    B, C, H, W = x_conv.shape
+    M = window_size * window_size  # tokens per window
+
+    # Padding: H/W 可能不能被 window_size 整除
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x_conv = F.pad(x_conv, (0, pad_w, 0, pad_h))
+
+    H_pad = H + pad_h
+    W_pad = W + pad_w
+    H_w = H_pad // window_size
+    W_w = W_pad // window_size
+    N_w = H_w * W_w
+
+    # 窗口划分: (B, C, H_pad, W_pad) → (B, N_w, M, C)
+    x_conv = x_conv.view(B, C, H_w, window_size, W_w, window_size)
+    x_conv = x_conv.permute(0, 2, 4, 3, 5, 1).contiguous()  # (B, H_w, W_w, ws, ws, C)
+    x_windows = x_conv.view(B, N_w, M, C)
+
+    # 窗口能量: L2 norm squared per token → mean over window tokens
+    # pre-LN: 不同区域的幅值差异可达 10~50 倍
+    token_norm_sq = (x_windows ** 2).sum(dim=-1)       # (B, N_w, M)
+    E_i = token_norm_sq.mean(dim=-1)                    # (B, N_w)
+
+    # 全局分布 p_i = E_i / sum(E_i)
+    p_i = E_i / (E_i.sum(dim=-1, keepdim=True) + 1e-8)  # (B, N_w)
+
+    # 熵 H = -sum(p_i * log(p_i))
+    H_ent = -(p_i * torch.log(p_i + 1e-8)).sum(dim=-1)   # (B,)
+
+    # 归一化: C_b = H / log(N_w)
+    H_max = torch.log(torch.tensor(N_w, dtype=torch.float32, device=x_conv.device))
+    C_b = (H_ent / H_max).unsqueeze(-1)                  # (B, 1) ∈ [0, 1]
+
+    return C_b.detach()
+
+
 def compute_erank(scores_2d: torch.Tensor) -> torch.Tensor:
     """从 window scores 计算图像级复杂度 C_b（梯度安全阻断）
 
@@ -404,49 +489,76 @@ def compute_erank(scores_2d: torch.Tensor) -> torch.Tensor:
 
 
 # ==========================================================================
-# tau debug: 记录 tau_raw / stage_policy / C_b / bias / τ 的数值关系
+# tau debug: 记录 MLP 输入 (s_mean/s_std/s_p50/s_max/C_b) 和输出 τ
 # ==========================================================================
 _TAU_DEBUG_COUNTER = 0
 _TAU_DEBUG_MAX = 3000
 
 
-def _write_tau_debug(strategy, stage, block, tau_raw, tau, C_b, stage_policy_val):
+def _write_tau_debug(strategy, stage, block, soft_hist, C_b, tau):
     global _TAU_DEBUG_COUNTER
     import os
-
-    bias = stage_policy_val * C_b  # (B, 1)，核心量：stage_policy 对 τ 的实际贡献
-
-    tau_raw_abs = tau_raw.abs().mean().item()
-    bias_abs = bias.abs().mean().item()
-    ratio = bias_abs / (tau_raw_abs + 1e-6)
 
     path = os.path.join(_export_base_path if _export_base_path else '/tmp', 'tau_debug.csv')
     if _TAU_DEBUG_COUNTER == 0:
         with open(path, 'w') as f:
+            bins = ",".join(f"h{i}" for i in range(16))
             f.write(
-                "iter,strategy,stage,block,"
-                "tau_raw_mean,tau_raw_std,tau_raw_abs,tau_raw_min,tau_raw_max,"
-                "stage_policy,"
-                "Cb_mean,Cb_std,"
-                "bias_mean,bias_std,bias_abs,"
-                "tau_mean,tau_std,tau_min,tau_max,"
-                "ratio\n"
+                f"iter,strategy,stage,block,"
+                f"{bins},"
+                f"C_b_val,C_b_min,C_b_max,C_b_std,"
+                f"tau_mean,tau_std,tau_min,tau_max\n"
             )
 
     with open(path, 'a') as f:
+        hist_str = ",".join(f"{soft_hist[0, i].item():.6f}" for i in range(16))
         f.write(
             f"{_TAU_DEBUG_COUNTER},{strategy},{stage},{block},"
-            f"{tau_raw.mean().item():.6f},{tau_raw.std().item():.6f},"
-            f"{tau_raw_abs:.6f},{tau_raw.min().item():.6f},{tau_raw.max().item():.6f},"
-            f"{stage_policy_val.item():.6f},"
-            f"{C_b.mean().item():.6f},{C_b.std().item():.6f},"
-            f"{bias.mean().item():.6f},{bias.std().item():.6f},{bias_abs:.6f},"
+            f"{hist_str},"
+            f"{C_b.mean().item():.6f},{C_b.min().item():.6f},"
+            f"{C_b.max().item():.6f},{C_b.std().item():.6f},"
             f"{tau.mean().item():.6f},{tau.std().item():.6f},"
-            f"{tau.min().item():.6f},{tau.max().item():.6f},"
-            f"{ratio:.6f}\n"
+            f"{tau.min().item():.6f},{tau.max().item():.6f}\n"
         )
 
     _TAU_DEBUG_COUNTER += 1
+
+
+def canonical_to_shifted(entropy, B, H_pad, W_pad, window_size, shift_size):
+    """将 canonical 窗口的 entropy 统计量映射到 shifted 窗口空间。
+
+    SW-MSA 通过 torch.roll 改变了窗口的空间划分，导致其窗口索引与
+    前一层 W-MSA 的 canonical 窗口不再一一对应。本函数通过 Broadcast →
+    Shift → Re-partition → Average 的轻量操作，将 canonical 窗口的
+    统计量映射到 shifted 窗口坐标系，使 INC 的跨层比较得以正确进行。
+
+    Args:
+        entropy:     canonical 窗口统计量, shape (B*N_win,)
+        B:           batch size
+        H_pad:       padded 特征图高度
+        W_pad:       padded 特征图宽度
+        window_size: 窗口大小
+        shift_size:  SW-MSA 的 shift 量
+
+    Returns:
+        shifted 窗口统计量, shape (B*N_win,)
+    """
+    H_w = H_pad // window_size
+    W_w = W_pad // window_size
+
+    # Broadcast window statistics to the spatial grid
+    e = entropy.view(B, H_w, W_w)
+    e = e.repeat_interleave(window_size, dim=1).repeat_interleave(window_size, dim=2)
+
+    # Coordinate transform: align to shifted window positions
+    e = torch.roll(e, shifts=(-shift_size, -shift_size), dims=(1, 2))
+
+    # Re-partition into shifted windows and aggregate statistics
+    e = e.view(B, H_w, window_size, W_w, window_size)
+    e = e.permute(0, 1, 3, 2, 4).contiguous()
+    e = e.view(B, H_w * W_w, window_size * window_size)
+
+    return e.mean(dim=-1).view(-1)
 
 
 def compute_gate_loss(
@@ -567,7 +679,9 @@ def kl_weighted_pool_and_align(
 
     prev_windows_flat = prev_windows.view(B, N_prev, -1, C_prev)
 
-    kl_weights = F.softmax(prev_kl_scores.view(B, N_prev), dim=-1)
+    # 使用原始 SRE 分数作为空间权重（不做全局 softmax），
+    # 后续在每个 2×2 下采样邻域内做局部 softmax 归一化。
+    kl_weights = prev_kl_scores.view(B, N_prev)
 
     # Step 1: Restore 2D spatial structure
     # prev_windows: (B*N_prev, ws, ws, C) → (B, H_prev, W_prev, ws, ws, C) → (B, H_prev*ws, W_prev*ws, C)
@@ -814,19 +928,6 @@ class SwinBlockV3(nn.Module):
         can_prune_kl = self.kl_ratio is not None and self.kl_ratio < 1.0
         can_prune_inc = self.inc_ratio is not None and self.inc_ratio < 1.0
 
-        if self.shift_size > 0:
-            return (
-                self._forward_base(x, hw_shape),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-
         if not can_prune_kl and not can_prune_inc:
             return (
                 self._forward_base(x, hw_shape),
@@ -901,7 +1002,7 @@ class SwinBlockV3(nn.Module):
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
 
-        if self.shift_size > 0 or self.kl_ratio is None:
+        if self.kl_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
             return base_result, None, None, None, None, None, None, None
 
@@ -912,30 +1013,21 @@ class SwinBlockV3(nn.Module):
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- Step 1: MLP 预测 τ_raw (无 sigmoid) -----
-        scores_flat = window_scores_reshaped.view(-1)
-        stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        tau_raw = self.kl_predictor(
-            stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1) raw logit
-
-        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
-        if C_b is None:
-            C_b = compute_erank(window_scores_reshaped)  # (B, 1)，首次计算
-        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
-
-        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
-        tau = torch.sigmoid(tau_raw + self.kl_predictor.stage_policy[self.stage_idx])  # (B, 1)
-
-        # ----- Step 2: Min-Max 归一化 (用于比较) -----
+        # ----- Step 1: Min-Max 归一化 (先归一化，histogram 才能有效) -----
         scores_min = window_scores_reshaped.min(dim=1, keepdim=True)[0]
         scores_max = window_scores_reshaped.max(dim=1, keepdim=True)[0]
         kl_norm_scores = (window_scores_reshaped - scores_min) / (
             scores_max - scores_min + 1e-8
         )
 
+        # ----- Step 2: Soft Histogram + MLP 预测 τ -----
+        soft_hist = compute_soft_histogram(kl_norm_scores.view(-1), B, K=16)
+        kl_threshold = self.kl_predictor(
+            soft_hist, C_b, self.stage_idx, self.block_idx
+        )  # (B, 1) ∈ [0, 1]
+
         # ----- Step 3: 软掩码计算 -----
-        tau_tiled = tau.squeeze(-1).unsqueeze(
+        tau_tiled = kl_threshold.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_kl = torch.sigmoid(
@@ -944,7 +1036,7 @@ class SwinBlockV3(nn.Module):
         # m_mask_kl = torch.clamp(m_mask_kl, min=1e-6, max=1 - 1e-6)
 
         # ----- Step 4: 硬掩码 + Fallback -----
-        kl_keep_mask = kl_norm_scores > tau  # (B, N_win)
+        kl_keep_mask = kl_norm_scores > kl_threshold  # (B, N_win)
         # fallback: 每张图至少保留分数最高的窗口
         # fallback = torch.zeros_like(kl_keep_mask)
         # fallback[
@@ -1006,9 +1098,17 @@ class SwinBlockV3(nn.Module):
             self.kl_gate_loss = kl_loss
             for b in range(B):
                 collect_threshold(
-                    tau[b].item(), self.stage_idx, self.block_idx, "kl"
+                    kl_threshold[b].item(), self.stage_idx, self.block_idx, "kl"
                 )
             block_gate_loss = (kl_loss, None, kl_info, kl_reg, None, None)
+
+        # ----- 记录剪枝统计 -----
+        self._keep_stats = {
+            'kl_keep': kl_keep_idx_flat.shape[0],
+            'final_keep': kl_keep_idx_flat.shape[0],  # KL-only: 最终保留 = KL保留
+            'total': total_windows,
+            'kl_tau': kl_threshold.mean().item(),
+        }
 
         # 数值检查
         if not torch.isfinite(x).all():
@@ -1061,7 +1161,7 @@ class SwinBlockV3(nn.Module):
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
 
-        if self.shift_size > 0 or self.inc_ratio is None:
+        if self.inc_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
             return base_result, None, None, None, None, None, None, None
 
@@ -1082,41 +1182,46 @@ class SwinBlockV3(nn.Module):
         inc_scores = torch.zeros_like(cur_entropy)
 
         if entropy_cache is not None and entropy_cache.shape[0] == total_windows:
-            inc_scores = torch.abs(cur_entropy - entropy_cache.detach())
+            if self.shift_size > 0:
+                cache_src = canonical_to_shifted(
+                    entropy_cache, B, H_pad, W_pad,
+                    self.window_size, self.shift_size
+                )
+            else:
+                cache_src = entropy_cache
+            inc_scores = torch.abs(cur_entropy - cache_src.detach())
         elif (
             prev_aligned_entropy is not None
             and prev_aligned_entropy.shape[0] == total_windows
         ):
-            cross_stage_scores = torch.abs(cur_entropy - prev_aligned_entropy.detach())
+            if self.shift_size > 0:
+                aligned_src = canonical_to_shifted(
+                    prev_aligned_entropy, B, H_pad, W_pad,
+                    self.window_size, self.shift_size
+                )
+            else:
+                aligned_src = prev_aligned_entropy
+            cross_stage_scores = torch.abs(cur_entropy - aligned_src.detach())
             inc_scores = cross_stage_scores
 
         inc_scores_reshaped = inc_scores.view(B, -1)
         _collect_inc_scores(inc_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- Step 1: MLP 预测 τ_raw (无 sigmoid) -----
-        scores_flat = inc_scores_reshaped.view(-1)
-        stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        tau_raw = self.inc_predictor(
-            stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1) raw logit
-
-        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
-        if C_b is None:
-            C_b = compute_erank(inc_scores_reshaped)  # (B, 1)，首次计算
-        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
-
-        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
-        tau = torch.sigmoid(tau_raw + self.inc_predictor.stage_policy[self.stage_idx])  # (B, 1)
-
-        # ----- Step 2: Min-Max 归一化 -----
+        # ----- Step 1: Min-Max 归一化 -----
         scores_min = inc_scores_reshaped.min(dim=1, keepdim=True)[0]
         scores_max = inc_scores_reshaped.max(dim=1, keepdim=True)[0]
         inc_norm_scores = (inc_scores_reshaped - scores_min) / (
             scores_max - scores_min + 1e-8
         )
 
+        # ----- Step 2: Soft Histogram + MLP 预测 τ -----
+        soft_hist = compute_soft_histogram(inc_norm_scores.view(-1), B, K=16)
+        inc_threshold = self.inc_predictor(
+            soft_hist, C_b, self.stage_idx, self.block_idx
+        )  # (B, 1) ∈ [0, 1]
+
         # ----- Step 3: 软掩码计算 -----
-        tau_tiled = tau.squeeze(-1).unsqueeze(
+        tau_tiled = inc_threshold.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_inc = torch.sigmoid(
@@ -1125,7 +1230,7 @@ class SwinBlockV3(nn.Module):
         m_mask_inc = torch.clamp(m_mask_inc, min=1e-6, max=1 - 1e-6)
 
         # ----- Step 4: 硬掩码 + Fallback -----
-        inc_keep_mask = inc_norm_scores > tau  # (B, N_win)
+        inc_keep_mask = inc_norm_scores > inc_threshold  # (B, N_win)
         fallback = torch.zeros_like(inc_keep_mask)
         fallback[
             torch.arange(B, device=x.device), inc_scores_reshaped.argmax(dim=1)
@@ -1174,9 +1279,17 @@ class SwinBlockV3(nn.Module):
             self.inc_gate_loss = inc_loss
             for b in range(B):
                 collect_threshold(
-                    tau[b].item(), self.stage_idx, self.block_idx, "inc"
+                    inc_threshold[b].item(), self.stage_idx, self.block_idx, "inc"
                 )
             block_gate_loss = (None, inc_loss, None, None, inc_info, inc_reg)
+
+        # ----- 记录剪枝统计 -----
+        self._keep_stats = {
+            'kl_keep': total_windows,         # INC-only: 全部窗口走 Attention
+            'final_keep': inc_keep_idx_flat.shape[0],  # INC 过滤 FFN
+            'total': total_windows,
+            'inc_tau': inc_threshold.mean().item(),
+        }
 
         # 数值检查
         if not torch.isfinite(x).all():
@@ -1186,10 +1299,12 @@ class SwinBlockV3(nn.Module):
             x,
             cur_entropy.detach(),
             x_windows,
-            None,
-            hw_shape,
-            self.embed_dims,
-            block_gate_loss,
+            None,                         # x_windows_new (INC 模式下不使用)
+            inc_scores_reshaped,          # scores (充当 kl_scores 角色)
+            (H_pad, W_pad),               # block_hw_shape (使用 pad 后的尺寸)
+            self.embed_dims,              # channel
+            inc_keep_idx_flat,            # keep_idx
+            block_gate_loss,              # gate_loss
         )
 
     def _forward_kl_inc(
@@ -1227,7 +1342,7 @@ class SwinBlockV3(nn.Module):
         total_windows = x_windows.shape[0]
         N_win = total_windows // B
 
-        if self.shift_size > 0 or self.kl_ratio is None:
+        if self.kl_ratio is None:
             base_result = self._forward_base_with_pad(x, hw_shape, pad_r, pad_b)
             return base_result, None, None, None, None, None, None, None
 
@@ -1238,26 +1353,6 @@ class SwinBlockV3(nn.Module):
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
 
-        # ----- KL: MLP 预测 τ_raw (无 sigmoid) -----
-        scores_flat = window_scores_reshaped.view(-1)
-        stats_mean, stats_std, stats_p50, stats_max = collect_stats(scores_flat, B)
-        tau_raw = self.kl_predictor(
-            stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1) raw logit
-
-        # 图像级复杂度 C_b（Stage 0 计算，后续 stage 复用）
-        if C_b is None:
-            C_b = compute_erank(window_scores_reshaped)  # (B, 1)，首次计算
-        self._C_b = C_b.detach()  # 存储供 stage sequence 传递给下游 stage
-
-        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
-        tau = torch.sigmoid(tau_raw + self.kl_predictor.stage_policy[self.stage_idx])  # (B, 1)
-
-        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
-            _write_tau_debug('kl', self.stage_idx, self.block_idx,
-                             tau_raw, tau, C_b,
-                             self.kl_predictor.stage_policy[self.stage_idx])
-
         # ----- KL: Min-Max 归一化 -----
         scores_min = window_scores_reshaped.min(dim=1, keepdim=True)[0]
         scores_max = window_scores_reshaped.max(dim=1, keepdim=True)[0]
@@ -1265,8 +1360,18 @@ class SwinBlockV3(nn.Module):
             scores_max - scores_min + 1e-8
         )
 
+        # ----- KL: Soft Histogram + MLP 预测 τ -----
+        soft_hist = compute_soft_histogram(kl_norm_scores.view(-1), B, K=16)
+        kl_threshold = self.kl_predictor(
+            soft_hist, C_b, self.stage_idx, self.block_idx
+        )  # (B, 1) ∈ [0, 1]
+
+        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
+            _write_tau_debug('kl', self.stage_idx, self.block_idx,
+                             soft_hist, C_b, kl_threshold)
+
         # ----- KL: 软掩码计算 -----
-        tau_tiled = tau.squeeze(-1).unsqueeze(
+        tau_tiled = kl_threshold.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_kl = torch.sigmoid(
@@ -1275,7 +1380,7 @@ class SwinBlockV3(nn.Module):
         m_mask_kl = torch.clamp(m_mask_kl, min=1e-6, max=1 - 1e-6)
 
         # ----- KL: 硬掩码 + Fallback -----
-        kl_keep_mask = kl_norm_scores > tau  # (B, N_win)
+        kl_keep_mask = kl_norm_scores > kl_threshold  # (B, N_win)
         fallback = torch.zeros_like(kl_keep_mask)
         fallback[
             torch.arange(B, device=x.device), window_scores_reshaped.argmax(dim=1)
@@ -1314,15 +1419,29 @@ class SwinBlockV3(nn.Module):
         inc_scores_survived = torch.zeros_like(cur_entropy)
 
         if entropy_cache is not None and entropy_cache.shape[0] == total_windows:
+            if self.shift_size > 0:
+                cache_src = canonical_to_shifted(
+                    entropy_cache, B, H_pad, W_pad,
+                    self.window_size, self.shift_size
+                )
+            else:
+                cache_src = entropy_cache
             inc_scores_survived = torch.abs(
-                cur_entropy - entropy_cache[kl_keep_idx_flat].detach()
+                cur_entropy - cache_src[kl_keep_idx_flat].detach()
             )
         elif (
             prev_aligned_entropy is not None
             and prev_aligned_entropy.shape[0] == total_windows
         ):
+            if self.shift_size > 0:
+                aligned_src = canonical_to_shifted(
+                    prev_aligned_entropy, B, H_pad, W_pad,
+                    self.window_size, self.shift_size
+                )
+            else:
+                aligned_src = prev_aligned_entropy
             cross_stage_scores = torch.abs(
-                cur_entropy - prev_aligned_entropy[kl_keep_idx_flat].detach()
+                cur_entropy - aligned_src[kl_keep_idx_flat].detach()
             )
             inc_scores_survived = cross_stage_scores
 
@@ -1332,29 +1451,7 @@ class SwinBlockV3(nn.Module):
         inc_scores_full.view(-1)[kl_keep_idx_flat] = inc_scores_survived
         _collect_inc_scores(inc_scores_full, self.stage_idx, self.block_idx)
 
-        # ----- INC: MLP 预测 τ_raw (无 sigmoid) -----
-        # 必须用 inc_scores_full.view(-1) 而不是 inc_scores_survived.view(-1)
-        # 因为后者长度 = N_kl (动态)，无法 view(B, N_win)
-        raw_inc_scores_flat = inc_scores_full.view(-1)
-        stats_mean, stats_std, stats_p50, stats_max = collect_stats(
-            raw_inc_scores_flat, B, mask=kl_keep_mask
-        )
-        tau_raw = self.inc_predictor(
-            stats_mean, stats_std, stats_p50, stats_max, self.stage_idx, self.block_idx
-        )  # (B, 1) raw logit
-
-        # 图像级复杂度 C_b（复用 KL 路径计算结果，不重复计算）
-
-        # stage_policy 调制: τ = sigmoid(τ_raw + stage_policy)
-        tau = torch.sigmoid(tau_raw + self.inc_predictor.stage_policy[self.stage_idx])  # (B, 1)
-
-        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
-            _write_tau_debug('inc', self.stage_idx, self.block_idx,
-                             tau_raw, tau, C_b,
-                             self.inc_predictor.stage_policy[self.stage_idx])
-
-        # ----- INC: Min-Max 归一化 (纯 GPU 加速版，无 CPU 同步) -----
-        # 用极值填充被排除的窗口，安全地按 Batch 计算极值
+        # ----- INC: Min-Max 归一化 (先归一化，histogram 才能有效) -----
         inc_for_max = torch.where(
             kl_keep_mask, inc_scores_full, torch.tensor(-1e9, device=x.device)
         )
@@ -1365,17 +1462,26 @@ class SwinBlockV3(nn.Module):
         inc_max = inc_for_max.amax(dim=1, keepdim=True)
         inc_min = inc_for_min.amin(dim=1, keepdim=True)
 
-        # Min-Max normalization
         inc_range = (inc_max - inc_min).clamp(min=1e-6)
         inc_norm_scores = (inc_scores_full - inc_min) / inc_range
 
-        # 核心修复：被 KL 剪掉的窗口，归一化分数强制设为 0.0 (不影响 Loss 的 sum)
+        # 被 KL 剪掉的窗口，归一化分数强制设为 0.0
         inc_norm_scores = torch.where(
             kl_keep_mask, inc_norm_scores, torch.tensor(0.0, device=x.device)
         )
 
+        # ----- INC: Soft Histogram + MLP 预测 τ -----
+        soft_hist = compute_soft_histogram(inc_norm_scores.view(-1), B, K=16)
+        inc_threshold = self.inc_predictor(
+            soft_hist, C_b, self.stage_idx, self.block_idx
+        )  # (B, 1) ∈ [0, 1]
+
+        if _TAU_DEBUG_COUNTER < _TAU_DEBUG_MAX:
+            _write_tau_debug('inc', self.stage_idx, self.block_idx,
+                             soft_hist, C_b, inc_threshold)
+
         # ----- INC: 软掩码计算 -----
-        tau_tiled = tau.squeeze(-1).unsqueeze(
+        tau_tiled = inc_threshold.squeeze(-1).unsqueeze(
             -1
         )  # (B, 1) -> (B, N_win)
         m_mask_inc = torch.sigmoid(
@@ -1389,12 +1495,15 @@ class SwinBlockV3(nn.Module):
         )
 
         # ----- INC: 硬掩码 + Fallback (INC 必须是 KL 的子集) -----
-        inc_keep_mask = (inc_norm_scores > tau) & kl_keep_mask
+        inc_keep_mask = (inc_norm_scores > inc_threshold) & kl_keep_mask
         inc_fallback = torch.zeros_like(inc_keep_mask)
+        # 将 KL 剪枝窗口的 inc_score 设为负值，确保 argmax 一定落在 K_SRE 内
+        inc_scores_for_fb = inc_scores_full.clone()
+        inc_scores_for_fb[~kl_keep_mask] = -1.0
         inc_fallback[
-            torch.arange(B, device=x.device), inc_scores_full.argmax(dim=1)
+            torch.arange(B, device=x.device), inc_scores_for_fb.argmax(dim=1)
         ] = True
-        inc_keep_mask = inc_keep_mask | (inc_fallback & kl_keep_mask)
+        inc_keep_mask = inc_keep_mask | inc_fallback
 
         # ----- INC: 软掩码注入 + FFN -----
         final_keep_idx_flat = torch.nonzero(inc_keep_mask.view(-1)).squeeze(-1)
@@ -1455,7 +1564,7 @@ class SwinBlockV3(nn.Module):
                 self.kl_gate_loss = kl_loss
                 for b in range(B):
                     collect_threshold(
-                        tau[b].item(), self.stage_idx, self.block_idx, "kl"
+                        kl_threshold[b].item(), self.stage_idx, self.block_idx, "kl"
                     )
 
             if self.inc_predictor is not None and inc_scores_full.numel() > 0:
@@ -1468,10 +1577,19 @@ class SwinBlockV3(nn.Module):
                 self.inc_gate_loss = inc_loss
                 for b in range(B):
                     collect_threshold(
-                        tau[b].item(), self.stage_idx, self.block_idx, "inc"
+                        inc_threshold[b].item(), self.stage_idx, self.block_idx, "inc"
                     )
 
             block_gate_loss = (kl_loss, inc_loss, kl_info, kl_reg, inc_info, inc_reg)
+
+        # ----- 记录剪枝统计 -----
+        self._keep_stats = {
+            'kl_keep': kl_keep_idx_flat.shape[0],
+            'final_keep': final_keep_idx_flat.shape[0],
+            'total': total_windows,
+            'kl_tau': kl_threshold.mean().item(),
+            'inc_tau': inc_threshold.mean().item(),
+        }
 
         # 数值检查
         if not torch.isfinite(x).all():
@@ -1541,10 +1659,16 @@ class SwinBlockV3(nn.Module):
         return x
 
     def _compute_entropy(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute entropy from attention features"""
+        """Compute entropy from attention features, normalized by log(C).
+
+        Normalization ensures entropy values are in [0, 1] regardless of channel
+        count, enabling fair cross-stage DEV comparison.
+        """
         B_N, area, C = x.shape
         attn = F.softmax(x, dim=-1)
         entropy = -torch.sum(attn * torch.log(attn + 1e-8), dim=-1).mean(dim=1)
+        log_C = torch.log(torch.tensor(C, dtype=x.dtype, device=x.device))
+        entropy = entropy / log_C
         return entropy
 
 
@@ -1685,7 +1809,7 @@ class SwinBlockSequenceV3(nn.Module):
                 "prev_aligned_entropy", None
             )
             prev_kl_keep_idx = prev_cross_stage_info.get("prev_kl_keep_idx", None)
-            C_b = prev_cross_stage_info.get("C_b", None)  # 从上游 stage 获取全局 C_b
+            C_b = prev_cross_stage_info.get("C_b", None)  # 从上游获取全局 C_b
 
         last_wmsa_info = None
 
@@ -1693,10 +1817,6 @@ class SwinBlockSequenceV3(nn.Module):
             result = block(
                 x, hw_shape, entropy_cache, prev_aligned_entropy, prev_kl_keep_idx, C_b=C_b
             )
-
-            # 第一个 W-MSA block 会计算 C_b 并存入 block._C_b
-            if C_b is None and hasattr(block, '_C_b') and block._C_b is not None:
-                C_b = block._C_b
 
             if isinstance(result, tuple) and len(result) >= 8:
                 x = result[0]
@@ -1770,6 +1890,10 @@ class SwinBlockSequenceV3(nn.Module):
                 }
             else:
                 cross_stage_info = base_cross_stage_info
+        elif C_b is not None:
+            # 即使当前 stage 没有发生剪枝（last_wmsa_info 为空），
+            # 也要继续传播 C_b 给后续 stage 使用
+            cross_stage_info = {"C_b": C_b}
 
         if self.downsample is not None:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
@@ -1906,10 +2030,6 @@ class SwinTransformerV3(SwinTransformer):
         if use_learnable_gate:
             self.kl_predictor = ThresholdPredictor()
             self.inc_predictor = ThresholdPredictor()
-            # 将 stage_policy 直接挂载到 predictor 上，零侵入传参
-            num_stages = len(depths)
-            self.kl_predictor.stage_policy = nn.Parameter(torch.zeros(num_stages))
-            self.inc_predictor.stage_policy = nn.Parameter(torch.zeros(num_stages))
             self.register_buffer("kl_predictor_gate_loss", torch.zeros(1))
             self.register_buffer("inc_predictor_gate_loss", torch.zeros(1))
             self.register_buffer("kl_predictor_gate_info", torch.zeros(1))
@@ -1947,9 +2067,6 @@ class SwinTransformerV3(SwinTransformer):
             # Convert single value to list
             if isinstance(stage_ratio, (int, float)):
                 stage_ratio = [stage_ratio]
-
-            if not stage_blocks:
-                continue
 
             depth = len(stage.blocks)
 
@@ -2046,9 +2163,6 @@ class SwinTransformerV3(SwinTransformer):
 
             if isinstance(stage_inc_ratio, (int, float)):
                 stage_inc_ratio = [stage_inc_ratio]
-
-            if not stage_blocks:
-                continue
 
             depth = len(stage.blocks)
 
@@ -2248,13 +2362,27 @@ class SwinTransformerV3(SwinTransformer):
         Returns:
             outs: list of feature maps
         """
-        x, hw_shape = self.patch_embed(x)
+        # --- 拆开 patch_embed：Conv → C_b → LN ---
+        # 必须在 LN 之前从 Conv 原始输出计算 C_b，否则 LN 会抹平所有幅值差异
+        x_conv = self.patch_embed.projection(x)  # Conv2d, pre-LN
+        _, _, H_patches, W_patches = x_conv.shape
+        C_b = compute_erb_from_conv(x_conv, window_size=7)
+
+        # 继续 patch_embed 后半段：flatten + LN
+        x = x_conv.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        if self.patch_embed.norm is not None:
+            x = self.patch_embed.norm(x)
+        hw_shape = (H_patches, W_patches)
 
         if self.use_abs_pos_embed:
             x = x + self.absolute_pos_embed
         x = self.drop_after_pos(x)
 
-        cross_stage_info = None
+        cross_stage_info = {"C_b": C_b}  # 前面已经从 Conv 输出计算好了
+
+        # 进入训练模式时标记：下次 eval 需要重新初始化累积变量
+        if self.training:
+            self._eval_need_init = True
 
         outs = []
 
@@ -2370,11 +2498,126 @@ class SwinTransformerV3(SwinTransformer):
                 total_inc_gate_loss = total_inc_gate_loss / total_inc_count
                 total_inc_gate_info = total_inc_gate_info / total_inc_count
                 total_inc_gate_reg = total_inc_gate_reg / total_inc_count
+
+            # ----- 收集所有 block 的硬剪枝统计 -----
+            total_kl_keep = 0
+            total_final_keep = 0
+            total_windows_all = 0
+            total_kl_tau = 0.0
+            total_inc_tau = 0.0
+            kl_tau_count = 0
+            inc_tau_count = 0
+
+            for stage in self.stages:
+                for block in stage.blocks:
+                    if hasattr(block, '_keep_stats'):
+                        s = block._keep_stats
+                        total_kl_keep += s['kl_keep']
+                        total_final_keep += s['final_keep']
+                        total_windows_all += s['total']
+                        if 'kl_tau' in s:
+                            total_kl_tau += s['kl_tau']
+                            kl_tau_count += 1
+                        if 'inc_tau' in s:
+                            total_inc_tau += s['inc_tau']
+                            inc_tau_count += 1
+
+            self.kl_predictor_hard_kl_keep = total_kl_keep
+            self.kl_predictor_hard_final_keep = total_final_keep
+            self.kl_predictor_hard_total = total_windows_all
+            if kl_tau_count > 0:
+                self.kl_predictor_avg_tau = total_kl_tau / kl_tau_count
+            if inc_tau_count > 0:
+                self.inc_predictor_avg_tau = total_inc_tau / inc_tau_count
+
             self.kl_predictor_gate_loss = total_kl_gate_loss
             self.kl_predictor_gate_info = total_kl_gate_info
             self.kl_predictor_gate_reg = total_kl_gate_reg
             self.inc_predictor_gate_loss = total_inc_gate_loss
             self.inc_predictor_gate_info = total_inc_gate_info
             self.inc_predictor_gate_reg = total_inc_gate_reg
+
+        # ==========================================
+        # eval 模式下累积剪枝统计，all_reduce 汇总后打印
+        # ==========================================
+        if not self.training and total_windows_all > 0:
+            import torch.distributed as dist
+
+            # 新 eval 会话：初始化累积变量
+            if getattr(self, '_eval_need_init', True):
+                self._eval_cum_kl_keep = 0
+                self._eval_cum_final_keep = 0
+                self._eval_cum_total = 0
+                self._eval_cum_kl_tau = 0.0
+                self._eval_cum_inc_tau = 0.0
+                self._eval_cum_kl_tau_count = 0
+                self._eval_cum_inc_tau_count = 0
+                self._eval_cum_batches = 0
+                self._eval_need_init = False
+
+            # 累加本 rank 的 batch
+            self._eval_cum_kl_keep += total_kl_keep
+            self._eval_cum_final_keep += total_final_keep
+            self._eval_cum_total += total_windows_all
+            if kl_tau_count > 0:
+                self._eval_cum_kl_tau += total_kl_tau
+                self._eval_cum_kl_tau_count += kl_tau_count
+            if inc_tau_count > 0:
+                self._eval_cum_inc_tau += total_inc_tau
+                self._eval_cum_inc_tau_count += inc_tau_count
+            self._eval_cum_batches += 1
+
+            # all_reduce 汇总所有 GPU 的累积值
+            if dist.is_initialized():
+                t = torch.tensor([
+                    self._eval_cum_kl_keep,
+                    self._eval_cum_final_keep,
+                    self._eval_cum_total,
+                    self._eval_cum_kl_tau,
+                    self._eval_cum_inc_tau,
+                    self._eval_cum_kl_tau_count,
+                    self._eval_cum_inc_tau_count,
+                ], device=x.device, dtype=torch.float64)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                t = t.tolist()
+            else:
+                t = [
+                    self._eval_cum_kl_keep,
+                    self._eval_cum_final_keep,
+                    self._eval_cum_total,
+                    self._eval_cum_kl_tau,
+                    self._eval_cum_inc_tau,
+                    self._eval_cum_kl_tau_count,
+                    self._eval_cum_inc_tau_count,
+                ]
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            if rank == 0:
+                c = t[2]
+                kl_pr = 1.0 - t[0] / c if c > 0 else 0.0
+                inc_pr = 1.0 - t[1] / max(t[0], 1)
+                final_pr = 1.0 - t[1] / c if c > 0 else 0.0
+                kl_t = t[3] / max(t[5], 1)
+                inc_t = t[4] / max(t[6], 1)
+                print(f'[PruneStats] batch={self._eval_cum_batches} '
+                      f'kl_prune={kl_pr:.4f} inc_prune={inc_pr:.4f} final_prune={final_pr:.4f} '
+                      f'kl_tau={kl_t:.4f} inc_tau={inc_t:.4f} '
+                      f'(final_keep={t[1]:.0f}/{c:.0f})')
+
+                # 第一个 eval batch 打印 per-block 剪枝率
+                if self._eval_cum_batches == 1:
+                    for si, stage in enumerate(self.stages):
+                        for bi, block in enumerate(stage.blocks):
+                            if hasattr(block, '_keep_stats'):
+                                s = block._keep_stats
+                                kl_p = 1.0 - s['kl_keep'] / max(s['total'], 1)
+                                inc_p = 1.0 - s['final_keep'] / max(s['kl_keep'], 1)
+                                final_p = 1.0 - s['final_keep'] / max(s['total'], 1)
+                                shift = 'SW' if bi % 2 == 1 else 'W '
+                                mode = 'inc' if 'inc_tau' in s else 'kl '
+                                print(f'  [Block] S{si}B{bi} {shift} {mode}: '
+                                      f'kl_prune={kl_p:.4f} inc_prune={inc_p:.4f} '
+                                      f'final_prune={final_p:.4f} '
+                                      f'(keep={s["final_keep"]}/{s["total"]})')
 
         return outs

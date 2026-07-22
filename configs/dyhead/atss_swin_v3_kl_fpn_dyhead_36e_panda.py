@@ -3,20 +3,17 @@ _base_ = [
 ]
 
 custom_imports = dict(
-    imports=['sparse_former.utils.entropy_vis_hook'],
+    imports=['sparse_former.models.backbones', 'sparse_former.models.detectors'],
     allow_failed_imports=False
 )
 
-pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
+# pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_kl_inc/14'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_dyhead/run3'
 
-find_unused_parameters=True
+find_unused_parameters = True
 model = dict(
-    type='DINOWithGateLoss',
-    num_queries=900,
-    with_box_refine=True,
-    as_two_stage=True,
+    type='ATSSWithGateLoss',
     data_preprocessor=dict(
         type='DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
@@ -40,11 +37,11 @@ model = dict(
         with_cp=False,
         convert_weights=True,
         # init_cfg=dict(type='Pretrained', checkpoint=pretrained),
-        
-        # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
+
+        # ===== Entropy Pruning =====
         strategy='kl_inc',
-        
-        # KL 策略配置（strategy='kl' 时生效）
+
+        # KL strategy config
         stage_config={
             0: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
             1: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
@@ -52,82 +49,75 @@ model = dict(
             3: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
         },
 
-        # 增量策略配置（strategy='inc' 时生效）
+        # INC strategy config
         inc_stage_config={
-            # 0: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
             0: {'blocks': [1], 'inc_ratio': 0.7},
             1: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
             2: {'blocks': [0, 1, 2, 3, 4, 5], 'inc_ratio': [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]},
             3: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
         },
-        
-        # 可学习门控配置（使KL和INC的阈值可学习）
-        use_learnable_gate=True,  # 设为True开启可学习门控
-        temperature=0.5,           # 软掩码温度参数
-        lambda_kl=4.0,             # KL门控损失的正则化系数
-        lambda_inc=4.0,            # INC门控损失的正则化系数
-        ),
-    neck=dict(
-        type='ChannelMapper',
-        in_channels=[192, 384, 768],
-        kernel_size=1,
-        out_channels=256,
-        act_cfg=None,
-        norm_cfg=dict(type='GN', num_groups=32),
-        num_outs=4),
-    encoder=dict(
-        num_layers=6,
-        layer_cfg=dict(
-            self_attn_cfg=dict(embed_dims=256, num_levels=4,
-                               dropout=0.0),
-            ffn_cfg=dict(
-                embed_dims=256,
-                feedforward_channels=2048,
-                ffn_drop=0.0))),
-    decoder=dict(
-        num_layers=6,
-        return_intermediate=True,
-        layer_cfg=dict(
-            self_attn_cfg=dict(embed_dims=256, num_heads=8,
-                               dropout=0.0),
-            cross_attn_cfg=dict(embed_dims=256, num_levels=4,
-                               dropout=0.0),
-            ffn_cfg=dict(
-                embed_dims=256,
-                feedforward_channels=2048,
-                ffn_drop=0.0)),
-        post_norm_cfg=None),
-    positional_encoding=dict(
-        num_feats=128,
-        normalize=True,
-        offset=0.0,
-        temperature=20),
+
+        # Learnable gate config
+        use_learnable_gate=True,
+        temperature=0.5,
+        lambda_kl=2.0,
+        lambda_inc=2.0,
+    ),
+    neck=[
+        dict(
+            type='FPN',
+            in_channels=[192, 384, 768],
+            out_channels=256,
+            start_level=0,
+            add_extra_convs='on_output',
+            num_outs=5),
+        dict(
+            type='DyHead',
+            in_channels=256,
+            out_channels=256,
+            num_blocks=6,
+            # disable zero_init_offset to follow official implementation
+            zero_init_offset=False)
+    ],
     bbox_head=dict(
-        type='DINOHead',
+        type='ATSSHead',
         num_classes=1,
-        sync_cls_avg_factor=True,
+        in_channels=256,
+        pred_kernel_size=1,  # follow DyHead official implementation
+        stacked_convs=0,
+        feat_channels=256,
+        anchor_generator=dict(
+            type='AnchorGenerator',
+            ratios=[1.0],
+            octave_base_scale=8,
+            scales_per_octave=1,
+            strides=[8, 16, 32, 64, 128],
+            center_offset=0.5),  # follow DyHead official implementation
+        bbox_coder=dict(
+            type='DeltaXYWHBBoxCoder',
+            target_means=[.0, .0, .0, .0],
+            target_stds=[0.1, 0.1, 0.2, 0.2]),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
             loss_weight=1.0),
-        loss_bbox=dict(type='L1Loss', loss_weight=5.0),
-        loss_iou=dict(type='GIoULoss', loss_weight=2.0)),
-    dn_cfg=dict(
-        label_noise_scale=0.5,
-        box_noise_scale=1.0,
-        group_cfg=dict(dynamic=True, num_groups=None,
-                       num_dn_queries=100)),
+        loss_bbox=dict(type='GIoULoss', loss_weight=2.0),
+        loss_centerness=dict(
+            type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
+    # training and testing settings
     train_cfg=dict(
-        assigner=dict(
-            type='HungarianAssigner',
-            match_costs=[
-                dict(type='FocalLossCost', weight=2.0),
-                dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                dict(type='IoUCost', iou_mode='giou', weight=2.0)
-            ])),
-    test_cfg=dict(max_per_img=300))
+        assigner=dict(type='ATSSAssigner', topk=9),
+        allowed_border=-1,
+        pos_weight=-1,
+        debug=False),
+    test_cfg=dict(
+        nms_pre=1000,
+        min_bbox_size=0,
+        score_thr=0.05,
+        nms=dict(type='nms', iou_threshold=0.6),
+        max_per_img=100))
 
 train_pipeline = [
     dict(
@@ -177,8 +167,9 @@ optim_wrapper = dict(
         type='AdamW',
         lr=0.0001,
         weight_decay=0.0001),
-    clip_grad=dict(max_norm=0.1, norm_type=2))
-    # paramwise_cfg=dict(backbone=dict(lr_mult=0.1)))
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    # paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)})
+)
 
 max_epochs = 36
 train_cfg = dict(
@@ -198,7 +189,3 @@ param_scheduler = [
 ]
 
 auto_scale_lr = dict(base_batch_size=16)
-
-custom_hooks = [
-    dict(type='EntropyVisualizationHook', priority='VERY_HIGH')
-]

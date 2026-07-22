@@ -3,13 +3,13 @@ _base_ = [
 ]
 
 custom_imports = dict(
-    imports=['sparse_former.utils.entropy_vis_hook'],
+    imports=['sparse_former.models.backbones', 'sparse_former.models.detectors'],
     allow_failed_imports=False
 )
 
-pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
+# pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_kl_inc/14'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/sparsenet_entropy/run3'
 
 find_unused_parameters=True
 model = dict(
@@ -24,8 +24,8 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=1),
     backbone=dict(
-        type='SwinTransformerV3',
-        embed_dims=96,
+        type='SparseNetEntropy',
+        embed_dims=64,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
         window_size=7,
@@ -39,37 +39,17 @@ model = dict(
         out_indices=(1, 2, 3),
         with_cp=False,
         convert_weights=True,
-        # init_cfg=dict(type='Pretrained', checkpoint=pretrained),
-        
-        # 改动 strategy 切换: 'kl' 'inc'或 'kl_inc'
+        init_cfg=None,
+        # ===== Entropy Pruning =====
         strategy='kl_inc',
-        
-        # KL 策略配置（strategy='kl' 时生效）
-        stage_config={
-            0: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
-            1: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
-            2: {'blocks': [0, 1, 2, 3, 4, 5], 'ratio': [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]},
-            3: {'blocks': [0, 1], 'ratio': [0.7, 0.7]},
-        },
-
-        # 增量策略配置（strategy='inc' 时生效）
-        inc_stage_config={
-            # 0: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-            0: {'blocks': [1], 'inc_ratio': 0.7},
-            1: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-            2: {'blocks': [0, 1, 2, 3, 4, 5], 'inc_ratio': [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]},
-            3: {'blocks': [0, 1], 'inc_ratio': [0.7, 0.7]},
-        },
-        
-        # 可学习门控配置（使KL和INC的阈值可学习）
-        use_learnable_gate=True,  # 设为True开启可学习门控
-        temperature=0.5,           # 软掩码温度参数
-        lambda_kl=4.0,             # KL门控损失的正则化系数
-        lambda_inc=4.0,            # INC门控损失的正则化系数
-        ),
+        use_learnable_gate=True,
+        temperature=0.5,
+        lambda_kl=6.0,     # matches Swin V3; ~3.0 works well for log-barrier
+        lambda_inc=6.0,    # lower: applied depth-1 times per stage (cumulative)
+    ),
     neck=dict(
         type='ChannelMapper',
-        in_channels=[192, 384, 768],
+        in_channels=[128, 256, 512],
         kernel_size=1,
         out_channels=256,
         act_cfg=None,
@@ -91,7 +71,7 @@ model = dict(
             self_attn_cfg=dict(embed_dims=256, num_heads=8,
                                dropout=0.0),
             cross_attn_cfg=dict(embed_dims=256, num_levels=4,
-                               dropout=0.0),
+                                dropout=0.0),
             ffn_cfg=dict(
                 embed_dims=256,
                 feedforward_channels=2048,
@@ -168,8 +148,7 @@ train_pipeline = [
 ]
 train_dataloader = dict(
     dataset=dict(
-        filter_cfg=dict(filter_empty_gt=False), pipeline=train_pipeline),
-    num_workers=1)
+        filter_cfg=dict(filter_empty_gt=False), pipeline=train_pipeline))
 
 optim_wrapper = dict(
     type='OptimWrapper',
@@ -177,8 +156,9 @@ optim_wrapper = dict(
         type='AdamW',
         lr=0.0001,
         weight_decay=0.0001),
-    clip_grad=dict(max_norm=0.1, norm_type=2))
-    # paramwise_cfg=dict(backbone=dict(lr_mult=0.1)))
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)})
+)
 
 max_epochs = 36
 train_cfg = dict(
@@ -198,7 +178,3 @@ param_scheduler = [
 ]
 
 auto_scale_lr = dict(base_batch_size=16)
-
-custom_hooks = [
-    dict(type='EntropyVisualizationHook', priority='VERY_HIGH')
-]
