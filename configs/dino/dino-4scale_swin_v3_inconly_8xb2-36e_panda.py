@@ -65,7 +65,7 @@ model = dict(
         use_learnable_gate=True,  # 设为True开启可学习门控
         temperature=0.5,           # 软掩码温度参数
         # lambda_kl=1.0,             # KL门控损失的正则化系数
-        lambda_inc=4.0,            # INC门控损失的正则化系数
+        lambda_inc=3.0,            # INC门控损失的正则化系数
         ),
     neck=dict(
         type='ChannelMapper',

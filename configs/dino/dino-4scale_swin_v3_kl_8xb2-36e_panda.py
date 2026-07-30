@@ -9,7 +9,7 @@ custom_imports = dict(
 
 pretrained = '/data/linyujie/projects/Entropy_pruning/pretrained_model/swin_tiny_patch4_window7_224.pth'
 
-work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_kl_inc/14'
+work_dir = '/data/linyujie/projects/Entropy_pruning/outputs/v3_kl_inc/16'
 
 find_unused_parameters=True
 model = dict(
@@ -64,8 +64,8 @@ model = dict(
         # 可学习门控配置（使KL和INC的阈值可学习）
         use_learnable_gate=True,  # 设为True开启可学习门控
         temperature=0.5,           # 软掩码温度参数
-        lambda_kl=4.0,             # KL门控损失的正则化系数
-        lambda_inc=4.0,            # INC门控损失的正则化系数
+        lambda_kl=3,             # KL门控损失的正则化系数
+        lambda_inc=3,            # INC门控损失的正则化系数
         ),
     neck=dict(
         type='ChannelMapper',

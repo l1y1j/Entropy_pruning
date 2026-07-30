@@ -13,6 +13,8 @@ from mmdet.models.backbones.swin import (
     WindowMSA,
 )
 
+from sparse_former.models.backbones.entropy_utils import compute_window_variance
+
 
 # KL/INC 分数收集器（只收集前10张图）
 _kl_img_counter = 0
@@ -196,14 +198,18 @@ def reset_collectors():
 
 
 def compute_window_relative_entropy(
-    x_windows: torch.Tensor, B: int, window_size: int = 7
+    x_windows: torch.Tensor, B: int, window_size: int = 7,
+    H: int = None, W: int = None,
 ) -> torch.Tensor:
-    """Compute KL divergence for each window
+    """Compute KL divergence for each window.
 
     Args:
         x_windows: (total_windows, window_size, window_size, C)
         B: batch size
         window_size: window size
+        H, W:  un-padded feature-map height & width.  When given, windows that
+                overlap padding are excluded from the global reference so their
+                zero-filled tokens do not inflate KL scores.
 
     Returns:
         kl: (B * N_win,) KL score for each window
@@ -213,8 +219,24 @@ def compute_window_relative_entropy(
 
     x_windows = x_windows.view(B, N_win, window_size * window_size, C)
     local_dist = F.softmax(x_windows.mean(dim=2), dim=-1)
-    global_dist = local_dist.mean(dim=1, keepdim=True)
-    # kl = (local_dist * torch.log(local_dist / (global_dist + 1e-8))).sum(dim=-1)
+
+    # --- global reference (exclude padding windows when H,W are known) ---
+    if H is not None and W is not None:
+        H_w = (H + window_size - 1) // window_size   # = ceil(H/ws)
+        W_w = (W + window_size - 1) // window_size
+        w_idx = torch.arange(W_w, device=x_windows.device)
+        h_idx = torch.arange(H_w, device=x_windows.device)
+        valid_col = (w_idx + 1) * window_size <= W
+        valid_row = (h_idx + 1) * window_size <= H
+        valid_2d = valid_row.unsqueeze(1) & valid_col.unsqueeze(0)  # (H_w, W_w)
+        valid_mask = valid_2d.reshape(-1).unsqueeze(0).expand(B, -1)  # (B, N_win)
+        local_valid = local_dist.clone()
+        local_valid[~valid_mask] = 0.0
+        cnt = valid_mask.sum(dim=1, keepdim=True).float().clamp(min=1)
+        global_dist = local_valid.sum(dim=1, keepdim=True) / cnt.unsqueeze(-1)
+    else:
+        global_dist = local_dist.mean(dim=1, keepdim=True)
+
     kl = (local_dist * torch.log((local_dist + 1e-8) / (global_dist + 1e-8))).sum(
         dim=-1
     )
@@ -872,6 +894,8 @@ class SwinBlockV3(nn.Module):
         self.lambda_inc = lambda_inc
         self.kl_gate_loss = None
         self.inc_gate_loss = None
+        self.enable_selection_vis = False   # 执行状态可视化开关
+        self.selection_vis = None           # 存 kl/inc mask + 空间信息
 
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
@@ -990,7 +1014,7 @@ class SwinBlockV3(nn.Module):
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b), mode='replicate')
         H_pad, W_pad = x.shape[1], x.shape[2]
 
         shifted_x = (
@@ -1009,15 +1033,21 @@ class SwinBlockV3(nn.Module):
         # ==========================================
         # 阶段一：KL 动态阈值剪枝
         # ==========================================
-        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
+        window_scores = compute_window_relative_entropy(
+            x_windows, B, self.window_size, H=H, W=W)
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
-
-        # ----- Step 1: Min-Max 归一化 (先归一化，histogram 才能有效) -----
         scores_min = window_scores_reshaped.min(dim=1, keepdim=True)[0]
         scores_max = window_scores_reshaped.max(dim=1, keepdim=True)[0]
         kl_norm_scores = (window_scores_reshaped - scores_min) / (
             scores_max - scores_min + 1e-8
+        )
+
+        # ---- 方差分数（纯局部统计量，无全局上下文）----
+        var_scores = compute_window_variance(x_windows, B, self.window_size)
+        var_scores_2d = var_scores.view(B, -1)
+        var_norm_scores = (var_scores_2d - var_scores_2d.min(dim=1, keepdim=True)[0]) / (
+            var_scores_2d.max(dim=1, keepdim=True)[0] - var_scores_2d.min(dim=1, keepdim=True)[0] + 1e-8
         )
 
         # ----- Step 2: Soft Histogram + MLP 预测 τ -----
@@ -1044,6 +1074,19 @@ class SwinBlockV3(nn.Module):
         # ] = True
         # kl_keep_mask = kl_keep_mask | fallback
         kl_keep_idx_flat = torch.nonzero(kl_keep_mask.view(-1)).squeeze(-1)
+
+        # ----- 记录执行状态（可视化用，KL-only 无 INC）-----
+        if self.enable_selection_vis:
+            self.selection_vis = {
+                'kl_mask':  kl_keep_mask[0].detach().cpu(),
+                'inc_mask': torch.zeros_like(kl_keep_mask[0]).cpu(),
+                'kl_norm':  kl_norm_scores[0].detach().cpu(),
+                'var_norm': var_norm_scores[0].detach().cpu(),
+                'H':        H, 'W': W,
+                'H_pad':    H_pad, 'W_pad': W_pad,
+                'window_size': self.window_size,
+                'shift_size': self.shift_size,
+            }
 
         # ----- Step 5: 软掩码注入特征 -----
         x_kl = x_windows.view(-1, self.window_size * self.window_size, C)[
@@ -1149,7 +1192,7 @@ class SwinBlockV3(nn.Module):
         x = x.view(B, H, W, C)
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b), mode='replicate')
         H_pad, W_pad = x.shape[1], x.shape[2]
 
         shifted_x = (
@@ -1237,6 +1280,18 @@ class SwinBlockV3(nn.Module):
         ] = True
         inc_keep_mask = inc_keep_mask | fallback
         inc_keep_idx_flat = torch.nonzero(inc_keep_mask.view(-1)).squeeze(-1)
+
+        # ----- 记录执行状态（可视化用，INC-only：全量走 Attention）-----
+        if self.enable_selection_vis:
+            self.selection_vis = {
+                'kl_mask':  torch.ones_like(inc_keep_mask[0]).cpu(),
+                'inc_mask': inc_keep_mask[0].detach().cpu(),
+                'inc_norm': inc_norm_scores[0].detach().cpu(),
+                'H':        H, 'W': W,
+                'H_pad':    H_pad, 'W_pad': W_pad,
+                'window_size': self.window_size,
+                'shift_size': self.shift_size,
+            }
 
         # ----- Step 5: 软掩码注入特征 -----
         x_ffn_input = x_after_attn[inc_keep_idx_flat]
@@ -1330,7 +1385,7 @@ class SwinBlockV3(nn.Module):
 
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
-        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b), mode='replicate')
         H_pad, W_pad = x.shape[1], x.shape[2]
 
         shifted_x = (
@@ -1349,7 +1404,8 @@ class SwinBlockV3(nn.Module):
         # ==========================================
         # 阶段一：KL 动态阈值剪枝 (Attention Path)
         # ==========================================
-        window_scores = compute_window_relative_entropy(x_windows, B, self.window_size)
+        window_scores = compute_window_relative_entropy(
+            x_windows, B, self.window_size, H=H, W=W)
         window_scores_reshaped = window_scores.view(B, -1)
         _collect_kl_scores(window_scores_reshaped, self.stage_idx, self.block_idx)
 
@@ -1358,6 +1414,13 @@ class SwinBlockV3(nn.Module):
         scores_max = window_scores_reshaped.max(dim=1, keepdim=True)[0]
         kl_norm_scores = (window_scores_reshaped - scores_min) / (
             scores_max - scores_min + 1e-8
+        )
+
+        # ---- 方差分数（纯局部统计量，无全局上下文）----
+        var_scores = compute_window_variance(x_windows, B, self.window_size)
+        var_scores_2d = var_scores.view(B, -1)
+        var_norm_scores = (var_scores_2d - var_scores_2d.min(dim=1, keepdim=True)[0]) / (
+            var_scores_2d.max(dim=1, keepdim=True)[0] - var_scores_2d.min(dim=1, keepdim=True)[0] + 1e-8
         )
 
         # ----- KL: Soft Histogram + MLP 预测 τ -----
@@ -1504,6 +1567,22 @@ class SwinBlockV3(nn.Module):
             torch.arange(B, device=x.device), inc_scores_for_fb.argmax(dim=1)
         ] = True
         inc_keep_mask = inc_keep_mask | inc_fallback
+
+        # ----- 记录执行状态（可视化用）-----
+        if self.enable_selection_vis:
+            assert torch.all(~inc_keep_mask | kl_keep_mask), \
+                "INC must be subset of KL"
+            self.selection_vis = {
+                'kl_mask':  kl_keep_mask[0].detach().cpu(),   # (N_win,)
+                'inc_mask': inc_keep_mask[0].detach().cpu(),  # (N_win,)
+                'kl_norm':  kl_norm_scores[0].detach().cpu(), # KL分数
+                'inc_norm': inc_norm_scores[0].detach().cpu(),# DEV分数
+                'var_norm': var_norm_scores[0].detach().cpu(),# 方差分数
+                'H':        H, 'W': W,
+                'H_pad':    H_pad, 'W_pad': W_pad,
+                'window_size': self.window_size,
+                'shift_size': self.shift_size,
+            }
 
         # ----- INC: 软掩码注入 + FFN -----
         final_keep_idx_flat = torch.nonzero(inc_keep_mask.view(-1)).squeeze(-1)
@@ -2344,6 +2423,28 @@ class SwinTransformerV3(SwinTransformer):
             new_stage.downsample = stage.downsample
 
             self.stages[stage_idx] = new_stage
+
+    def set_enable_selection_vis(self, val: bool = True):
+        """Enable execution-state recording for visualisation.
+
+        Each block stores ``kl_keep_mask`` / ``inc_keep_mask`` in
+        ``selection_vis`` after every forward.
+        """
+        for stage in self.stages:
+            for block in stage.blocks:
+                if hasattr(block, 'enable_selection_vis'):
+                    block.enable_selection_vis = val
+
+    def set_force_full_ffn(self, val: bool = True):
+        """Enable full-FFN mode for FFN-update visualisation.
+
+        When enabled, every block skips pruning and stores per-window
+        FFN update magnitude in ``ffn_update_buffer``.
+        """
+        for stage in self.stages:
+            for block in stage.blocks:
+                if hasattr(block, 'force_full_ffn'):
+                    block.force_full_ffn = val
 
     def get_strategy_config(self) -> dict:
         """Get current strategy configuration"""

@@ -42,7 +42,43 @@ def compute_window_relative_entropy(x_windows, B, window_size=7):
 
 
 # ===========================================================================
-# 2. Soft Histogram
+# 2. Variance Score
+# ===========================================================================
+def compute_window_variance(x_windows, B, window_size=7):
+    """Compute per-window variance score (sparseformer formula).
+
+    Follows the same pattern as block_entropy.py's variance mode:
+      1. Mean-pool tokens within each window -> (B, N_win, C)
+      2. Softmax over channels -> channel probability distribution
+      3. Variance over channels -> variance score per window
+
+    High variance = peaked channel distribution = complex local texture.
+    This is a purely local statistic with no global context, so it tends to
+    flag repetitive but textured backgrounds as "important".
+
+    Args:
+        x_windows: (B*N, ws, ws, C)  window-partitioned features
+        B:         batch size
+        window_size: window spatial size (default 7)
+
+    Returns:
+        var_scores: (B*N,)  variance score per window
+    """
+    total_windows, ws_h, ws_w, C = x_windows.shape
+    N = total_windows // B
+
+    # (B*N, ws, ws, C) -> (B, N, ws*ws, C)
+    x = x_windows.view(B, N, window_size * window_size, C)
+    # mean over tokens -> (B, N, C) -> softmax over channels
+    window_dist = F.softmax(x.mean(dim=2), dim=-1)       # (B, N, C)
+    # variance of channel distribution per window
+    var_scores = window_dist.var(dim=-1)                  # (B, N)
+
+    return var_scores.view(-1)  # (B*N,)
+
+
+# ===========================================================================
+# 3. Soft Histogram
 # ===========================================================================
 def compute_soft_histogram(scores_flat, B, K=16, sigma=0.08):
     """Map window scores to a differentiable soft histogram.
@@ -80,7 +116,7 @@ def compute_soft_histogram(scores_flat, B, K=16, sigma=0.08):
 
 
 # ===========================================================================
-# 3. Gate Loss (log-barrier)
+# 4. Gate Loss (log-barrier)
 # ===========================================================================
 def compute_gate_loss(m_mask, scores, lambda_reg, valid_mask=None):
     """Log-barrier gate loss for entropy pruning.
@@ -140,7 +176,7 @@ def compute_gate_loss(m_mask, scores, lambda_reg, valid_mask=None):
 
 
 # ===========================================================================
-# 4. Image Complexity C_b
+# 5. Image Complexity C_b
 # ===========================================================================
 def compute_erb_from_conv(x_conv, window_size=7):
     """Compute image-level complexity C_b from raw Conv output (pre-LayerNorm).
@@ -196,7 +232,7 @@ def compute_erb_from_conv(x_conv, window_size=7):
 
 
 # ===========================================================================
-# 5. Min-Max Normalization
+# 6. Min-Max Normalization
 # ===========================================================================
 def min_max_normalize(scores_2d):
     """Min-Max normalize to [0, 1] along the window dimension.
